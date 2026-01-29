@@ -153,34 +153,26 @@ class OllamaClient:
         temperature: float = 0.7,
         max_tokens: int | None = None,
     ) -> LLMResponse:
-        """Chat completion (modo no-streaming)."""
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": [m.to_dict() for m in messages],
-            "stream": False,
-            "options": {
-                "temperature": temperature,
-            },
-        }
+        """Chat completion usando el endpoint generate."""
+        # Convertir mensajes a formato de prompt
+        system_messages = [m for m in messages if m.role == "system"]
+        user_messages = [m for m in messages if m.role == "user"]
+        
+        system_prompt = system_messages[0].content if system_messages else ""
+        user_prompt = user_messages[0].content if user_messages else ""
+        
+        # Combinar system y user en un solo prompt
+        if system_prompt:
+            full_prompt = f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:"
+        else:
+            full_prompt = user_prompt
 
-        if max_tokens:
-            payload["options"]["num_predict"] = max_tokens
-
-        response = await self.client.post(
-            f"{self.host}/api/chat",
-            json=payload,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        message = data.get("message", {})
-        return LLMResponse(
-            content=message.get("content", ""),
-            done=data.get("done", True),
-            total_duration=data.get("total_duration"),
-            load_duration=data.get("load_duration"),
-            prompt_eval_count=data.get("prompt_eval_count"),
-            eval_count=data.get("eval_count"),
+        # Usar el método generate que sabemos que funciona
+        return await self.generate(
+            prompt=full_prompt,
+            system=None,  # Ya está incluido en el prompt
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
 
     async def chat_stream(

@@ -1,5 +1,6 @@
 """Punto de entrada principal."""
 
+import asyncio
 import sys
 
 
@@ -8,7 +9,7 @@ def main() -> int:
     from .tui.app import TutorApp
 
     app = TutorApp()
-    app.run()
+    asyncio.run(app.run())
     return 0
 
 

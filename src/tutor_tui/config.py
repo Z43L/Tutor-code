@@ -15,14 +15,14 @@ class Config:
 
     # Ollama
     ollama_host: str = "http://localhost:11434"
-    ollama_model: str = "kimi-k2.5:cloud"
+    ollama_model: str = "glm-4.7:cloud"
     ollama_timeout: int = 120
 
     # Editor
     editor: str = "nvim"
 
     # Paths
-    data_dir: Path = Path(user_data_dir("tutor-tui", "claude-code"))
+    data_dir: Path = Path.home() / ".tutor"
     courses_dir: Path = field(init=False)
 
     # App
@@ -41,10 +41,10 @@ class Config:
 
         return cls(
             ollama_host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-            ollama_model=os.getenv("OLLAMA_MODEL", "llama3.1"),
+            ollama_model=os.getenv("OLLAMA_MODEL", "glm-4.7:cloud"),
             ollama_timeout=int(os.getenv("OLLAMA_TIMEOUT", "120")),
             editor=os.getenv("EDITOR", "nvim"),
-            data_dir=Path(data_dir) if data_dir else Path(user_data_dir("tutor-tui", "claude-code")),
+            data_dir=Path(data_dir) if data_dir else Path.home() / ".tutor",
         )
 
     def ensure_dirs(self) -> None:

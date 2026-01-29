@@ -1,283 +1,117 @@
-"""Aplicación TUI principal."""
+"""Aplicación de consola simple - BullCode Tutor."""
 
-from __future__ import annotations
-
+import asyncio
+import sys
+import json
+import subprocess
+import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.reactive import reactive
-from textual.widgets import (
-    Footer,
-    Header,
-    Input,
-    Label,
-    ListItem,
-    ListView,
-    RichLog,
-    Static,
-)
-
+# Importaciones necesarias
 from ..config import get_config
 from ..content.generator import ContentGenerationError, ContentGenerator
 from ..core.persistence import CoursePersistence
 from ..llm.client import OllamaClient
 
-if TYPE_CHECKING:
-    from ..core.course import Course
-    from ..core.state import CourseState
+if sys.platform == "win32":
+    import colorama
+    colorama.init()
 
 
-class CommandInput(Input):
-    """Input de comandos con historial."""
-
-    BINDINGS = [
-        ("up", "history_prev", "Previous"),
-        ("down", "history_next", "Next"),
-    ]
+class TutorApp:
+    """Tutor de consola simple."""
 
     def __init__(self) -> None:
-        super().__init__(placeholder="Escribe un comando (help para ayuda)")
-        self.history: list[str] = []
-        self.history_index = 0
-
-    def action_history_prev(self) -> None:
-        """Navegar a comando anterior."""
-        if self.history and self.history_index > 0:
-            self.history_index -= 1
-            self.value = self.history[self.history_index]
-
-    def action_history_next(self) -> None:
-        """Navegar a comando siguiente."""
-        if self.history_index < len(self.history) - 1:
-            self.history_index += 1
-            self.value = self.history[self.history_index]
-        else:
-            self.history_index = len(self.history)
-            self.value = ""
-
-    def add_to_history(self, cmd: str) -> None:
-        """Añadir comando al historial."""
-        if cmd and (not self.history or self.history[-1] != cmd):
-            self.history.append(cmd)
-        self.history_index = len(self.history)
-
-
-class StatusBar(Static):
-    """Barra de estado del curso."""
-
-    course_name = reactive("No hay curso activo")
-    current_unit = reactive("-")
-    progress = reactive("0%")
-
-    def compose(self) -> ComposeResult:
-        with Horizontal():
-            yield Label(self.course_name, id="status-course")
-            yield Label(f"  |  Unidad: {self.current_unit}", id="status-unit")
-            yield Label(f"  |  Progreso: {self.progress}", id="status-progress")
-
-    def watch_course_name(self, value: str) -> None:
-        """Actualizar cuando cambia el curso."""
-        label = self.query_one("#status-course", Label)
-        label.update(f"Curso: {value}")
-
-    def watch_current_unit(self, value: str) -> None:
-        """Actualizar cuando cambia la unidad."""
-        label = self.query_one("#status-unit", Label)
-        label.update(f"  |  Unidad: {value}")
-
-    def watch_progress(self, value: str) -> None:
-        """Actualizar cuando cambia el progreso."""
-        label = self.query_one("#status-progress", Label)
-        label.update(f"  |  Progreso: {value}")
-
-    def update_status(self, course: str | None, unit: int | None, prog: float | None) -> None:
-        """Actualizar todos los valores."""
-        self.course_name = course or "No hay curso activo"
-        self.current_unit = str(unit) if unit else "-"
-        self.progress = f"{prog:.0f}%" if prog is not None else "0%"
-
-
-class OutputLog(RichLog):
-    """Área de salida con formato Rich."""
-
-    def __init__(self) -> None:
-        super().__init__(highlight=True, markup=True, wrap=True)
-        self.border_title = "Salida"
-
-    def write_system(self, message: str) -> None:
-        """Escribir mensaje del sistema."""
-        self.write(f"[dim][sys][/dim] {message}")
-
-    def write_error(self, message: str) -> None:
-        """Escribir mensaje de error."""
-        self.write(f"[red][error][/red] {message}")
-
-    def write_success(self, message: str) -> None:
-        """Escribir mensaje de éxito."""
-        self.write(f"[green][ok][/green] {message}")
-
-    def write_info(self, message: str) -> None:
-        """Escribir información."""
-        self.write(f"[blue][info][/blue] {message}")
-
-    def write_tutor(self, message: str) -> None:
-        """Escribir mensaje del tutor."""
-        self.write(f"[cyan bold]Tutor:[/cyan bold] {message}")
-
-    def write_user(self, message: str) -> None:
-        """Escribir mensaje del usuario."""
-        self.write(f"[yellow bold]Tú:[/yellow bold] {message}")
-
-    def write_warning(self, message: str) -> None:
-        """Escribir advertencia."""
-        self.write(f"[yellow][warn][/yellow] {message}")
-
-
-class CourseListScreen:
-    """Pantalla de lista de cursos (implemementación simple en log por ahora)."""
-
-    pass
-
-
-class TutorApp(App):
-    """Aplicación principal del Tutor TUI."""
-
-    CSS = """
-    Screen {
-        align: center middle;
-    }
-
-    #main-container {
-        width: 100%;
-        height: 100%;
-    }
-
-    #output-panel {
-        width: 100%;
-        height: 1fr;
-        border: solid $primary;
-    }
-
-    #status-bar {
-        width: 100%;
-        height: auto;
-        padding: 0 1;
-        background: $surface;
-        color: $text;
-    }
-
-    #input-panel {
-        width: 100%;
-        height: auto;
-        padding: 0 1;
-    }
-
-    CommandInput {
-        width: 100%;
-    }
-
-    OutputLog {
-        padding: 0 1;
-    }
-    """
-
-    BINDINGS = [
-        ("ctrl+c", "quit", "Salir"),
-        ("ctrl+q", "quit", "Salir"),
-    ]
-
-    def __init__(self) -> None:
-        super().__init__()
         self.config = get_config()
         self.persistence = CoursePersistence(self.config.data_dir)
         self.content_generator = ContentGenerator()
-        self.current_course: Course | None = None
-        self.current_state: CourseState | None = None
-        self.pending_action: str | None = None
-        self.pending_data: dict | None = None
+        self.current_course = None
+        self.current_state = None
+        self.current_unit = None
+        self.pending_action = None
+        self.pending_data = None
+        self.ollama_model = self.config.ollama_model
 
-    def compose(self) -> ComposeResult:
-        """Componer interfaz."""
-        yield Header(show_clock=True)
+    def print_logo(self) -> None:
+        """Imprimir logo del toro."""
+        print("\033[38;5;208m" + r"""
+        ,     ,
+        |\---/|
+        | o_o |
+         \_^_/
+        / 6 6\
+        \_YY_/
+        """ + "\033[0m")
 
-        with Vertical(id="main-container"):
-            yield StatusBar(id="status-bar")
+    def print_header(self) -> None:
+        """Imprimir encabezado."""
+        print("\033[33m" + "="*50 + "\033[0m")
+        print("\033[33m" + "           ¡BullCode Tutor!" + "\033[0m")
+        print("\033[33m" + "    Tu tutor de programación con IA local" + "\033[0m")
+        print("\033[33m" + "="*50 + "\033[0m")
+        print()
 
-            output = OutputLog(id="output-panel")
-            output.border_title = "Bienvenido a Tutor TUI"
-            yield output
+    def print_info(self, message: str) -> None:
+        """Imprimir mensaje informativo."""
+        print(f"\033[38;5;208mℹ {message}\033[0m")
 
-            with Horizontal(id="input-panel"):
-                yield CommandInput()
+    def print_success(self, message: str) -> None:
+        """Imprimir mensaje de éxito."""
+        print(f"\033[32m✓ {message}\033[0m")
 
-        yield Footer()
+    def print_error(self, message: str) -> None:
+        """Imprimir mensaje de error."""
+        print(f"\033[31m✗ {message}\033[0m")
 
-    def on_mount(self) -> None:
-        """Al montar la app."""
-        self.show_welcome()
+    def print_tutor(self, message: str) -> None:
+        """Imprimir mensaje del tutor."""
+        print(f"\033[36m🤖 Tutor: {message}\033[0m")
+
+    def print_user(self, message: str) -> None:
+        """Imprimir mensaje del usuario."""
+        print(f"\033[33m👤 Tú: {message}\033[0m")
+
+    def get_input(self, prompt: str = "> ") -> str:
+        """Obtener input del usuario."""
+        try:
+            return input(f"\033[38;5;208m{prompt}\033[0m").strip()
+        except KeyboardInterrupt:
+            print("\n\033[33m¡Hasta luego!\033[0m")
+            sys.exit(0)
+        except EOFError:
+            print("\n\033[33m¡Hasta luego!\033[0m")
+            sys.exit(0)
 
     def show_welcome(self) -> None:
         """Mostrar mensaje de bienvenida."""
-        log = self.query_one(OutputLog)
-        log.clear()
-        log.write("""
-[cyan bold]╔══════════════════════════════════════════════════════════════╗
-║                    Bienvenido a Tutor TUI                     ║
-║              Tu tutor de programación con IA local           ║
-╚══════════════════════════════════════════════════════════════╝[/cyan bold]
+        self.print_logo()
+        self.print_header()
+        self.print_info("Escribe 'new' para crear un curso")
+        self.print_info("Escribe 'resume' para continuar un curso")
+        self.print_info("Escribe 'help' para ver todos los comandos")
+        print()
 
-""")
-        log.write_info("Escribe [bold]new[/bold] para crear un curso o [bold]resume[/bold] para continuar")
-        log.write_info("Escribe [bold]help[/bold] para ver todos los comandos disponibles")
+    async def run(self) -> None:
+        """Ejecutar la aplicación."""
+        self.show_welcome()
 
-    def get_output_log(self) -> OutputLog:
-        """Obtener el log de salida."""
-        return self.query_one(OutputLog)
+        while True:
+            try:
+                command = self.get_input()
+                if not command:
+                    continue
 
-    def get_status_bar(self) -> StatusBar:
-        """Obtener la barra de estado."""
-        return self.query_one(StatusBar)
+                await self.process_command(command)
 
-    def update_status(self) -> None:
-        """Actualizar barra de estado."""
-        status = self.get_status_bar()
-        if self.current_course and self.current_state:
-            # Calcular progreso
-            total_units = len(self.current_course.units)
-            completed = sum(
-                1 for p in self.current_state.unit_progress.values()
-                if p.status == "completed"
-            )
-            progress = (completed / total_units * 100) if total_units > 0 else 0
-            status.update_status(
-                self.current_course.metadata.title,
-                self.current_state.current_unit,
-                progress
-            )
-        else:
-            status.update_status(None, None, None)
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Procesar comando ingresado."""
-        input_widget = self.query_one(CommandInput)
-        command = event.value.strip()
-
-        if not command:
-            return
-
-        input_widget.add_to_history(command)
-        input_widget.value = ""
-
-        log = self.get_output_log()
-        log.write_user(command)
-
-        await self.process_command(command)
+            except KeyboardInterrupt:
+                print("\n\033[33m¡Hasta luego!\033[0m")
+                break
+            except Exception as e:
+                self.print_error(f"Error: {e}")
+                continue
 
     async def process_command(self, command: str) -> None:
         """Procesar comando del usuario."""
-        log = self.get_output_log()
         parts = command.split()
         cmd = parts[0].lower()
         args = parts[1:]
@@ -302,1090 +136,1493 @@ class TutorApp(App):
             "export": self.cmd_export,
             "import": self.cmd_import,
             "delete": self.cmd_delete,
+            "model": self.cmd_model,
         }
 
         handler = handlers.get(cmd)
         if handler:
             await handler(args)
         else:
-            log.write_error(f"Comando desconocido: {cmd}")
-            log.write_info("Escribe 'help' para ver los comandos disponibles")
+            self.print_error(f"Comando desconocido: {cmd}")
+            self.print_info("Escribe '/help' para ver los comandos disponibles")
 
-    # ========== Comandos ==========
-
-    async def cmd_help(self, args: list[str]) -> None:
+    async def cmd_help(self, args) -> None:
         """Mostrar ayuda."""
-        log = self.get_output_log()
-        help_text = """
-[bold green]Comandos disponibles:[/bold green]
+        print("\033[32m🤖 BullCode Tutor - Comandos disponibles\033[0m")
+        print()
+        print("\033[33m💬 Interacción principal:\033[0m")
+        print("  \033[36m[texto cualquiera]\033[0m     - Preguntar al tutor (comando por defecto)")
+        print("  \033[36m¿Dudas sobre React?\033[0m     - Ejemplo: cualquier pregunta")
+        print()
+        print("\033[33m📚 Gestión de cursos:\033[0m")
+        print("  \033[36m/new\033[0m                   - Crear nuevo curso")
+        print("  \033[36m/resume\033[0m                - Listar y reanudar cursos existentes")
+        print("  \033[36m/list\033[0m                  - Listar todos los cursos")
+        print("  \033[36m/delete <slug>\033[0m         - Eliminar un curso")
+        print()
+        print("\033[33m📖 Navegación y contenido:\033[0m")
+        print("  \033[36m/unit <n>\033[0m              - Cambiar a unidad N")
+        print("  \033[36m/read\033[0m                  - Leer material de la unidad actual")
+        print("  \033[36m/progress\033[0m              - Ver progreso del curso")
+        print()
+        print("\033[33m🧠 Práctica y evaluación:\033[0m")
+        print("  \033[36m/quiz\033[0m                  - Iniciar quiz de la unidad")
+        print("  \033[36m/lab\033[0m                   - Listar labs de la unidad")
+        print("  \033[36m/lab <n>\033[0m               - Seleccionar lab N")
+        print("  \033[36m/edit\033[0m                  - Abrir editor en el lab actual")
+        print("  \033[36m/submit\033[0m                - Evaluar y entregar lab")
+        print()
+        print("\033[33m🤖 Ollama:\033[0m")
+        print("  \033[36m/model\033[0m                - Ver modelo actual y disponibles")
+        print("  \033[36m/model <nombre>\033[0m       - Seleccionar modelo de Ollama")
+        print()
+        print("\033[33m💾 Import/Export:\033[0m")
+        print("  \033[36m/export\033[0m                - Exportar curso a ZIP")
+        print("  \033[36m/import <ruta>\033[0m         - Importar curso desde ZIP")
+        print()
+        print("\033[33mGeneral:\033[0m")
+        print("  \033[36m/help\033[0m             - Mostrar esta ayuda")
+        print("  \033[36m/quit, /exit, /q\033[0m    - Salir de la aplicación")
+        print()
+        print("\033[37m💡 Tip: Simplemente escribe tu pregunta para hablar con el tutor\033[0m")
 
-[bold]Gestión de cursos:[/bold]
-  [cyan]new[/cyan]              - Crear nuevo curso (wizard)
-  [cyan]resume[/cyan]           - Listar y reanudar cursos existentes
-  [cyan]list[/cyan]             - Listar todos los cursos
-  [cyan]delete <slug>[/cyan]    - Eliminar un curso
+    async def cmd_new(self, args) -> None:
+        """Crear nuevo curso con asistente completo."""
+        self.print_info("🚀 Creando nuevo curso...")
+        print()
 
-[bold]Navegación:[/bold]
-  [cyan]unit <n>[/cyan]         - Cambiar a unidad N
-  [cyan]read[/cyan]             - Leer material de la unidad actual
-  [cyan]progress[/cyan]         - Ver progreso del curso
-
-[bold]Interacción:[/bold]
-  [cyan]ask <pregunta>[/cyan]   - Preguntar al tutor
-  [cyan]quiz[/cyan]             - Iniciar quiz de la unidad
-
-[bold]Práctica:[/bold]
-  [cyan]lab[/cyan]              - Listar labs de la unidad
-  [cyan]lab <n>[/cyan]          - Seleccionar lab N
-  [cyan]edit[/cyan]             - Abrir editor en el lab actual
-  [cyan]submit[/cyan]           - Evaluar y entregar lab
-
-[bold]Import/Export:[/bold]
-  [cyan]export[/cyan]           - Exportar curso a ZIP
-  [cyan]import <ruta>[/cyan]    - Importar curso desde ZIP
-
-[bold]General:[/bold]
-  [cyan]help[/cyan]             - Mostrar esta ayuda
-  [cyan]quit, exit, q[/cyan]    - Salir de la aplicación
-"""
-        log.write(help_text)
-
-    async def cmd_new(self, args: list[str]) -> None:
-        """Crear nuevo curso - wizard interactivo."""
-        log = self.get_output_log()
-
-        # Verificar conexión con Ollama primero
-        log.write_info("Verificando conexión con Ollama...")
-        try:
-            status = await self.content_generator.check_ollama()
-            if not status.get("ok"):
-                log.write_error(f"No se pudo conectar con Ollama: {status.get('error')}")
-                log.write_info("Asegúrate de que Ollama esté corriendo en http://localhost:11434")
-                log.write_info("O ajusta OLLAMA_HOST si usas otro endpoint")
-                return
-
-            models = status.get("data", {}).get("models", [])
-            if not models:
-                log.write_error("Ollama está corriendo pero no hay modelos disponibles")
-                log.write_info("Descarga un modelo con: ollama pull llama3.1")
-                return
-
-            model_names = [m.get("name", m.get("model", "unknown")) for m in models]
-            log.write_success(f"Ollama conectado. Modelos disponibles: {', '.join(model_names[:3])}")
-
-        except Exception as e:
-            log.write_error(f"Error verificando Ollama: {e}")
+        # Recopilar información del curso
+        self.print_tutor("¿Qué tema quieres aprender?")
+        self.print_info("Ejemplos: Python, React, Machine Learning, DevOps, etc.")
+        topic = self.get_input("Tema: ").strip()
+        if not topic:
             return
 
-        log.write_info("\nCreando nuevo curso...")
-        self.pending_action = "new_course_topic"
-        log.write_tutor("¿Qué tema quieres aprender?")
-        log.write_info("Ejemplos: Python, Rust, Docker, Kubernetes, Machine Learning, etc.")
+        self.print_tutor(f"Tema seleccionado: {topic}")
+        print()
 
-    async def cmd_resume(self, args: list[str]) -> None:
-        """Listar y cargar cursos existentes."""
-        log = self.get_output_log()
+        self.print_tutor("¿Qué nivel deseas? (beginner/intermediate/advanced)")
+        level = self.get_input("Nivel: ").lower().strip()
+        while level not in ["beginner", "intermediate", "advanced"]:
+            self.print_error("Por favor elige: beginner, intermediate, o advanced")
+            level = self.get_input("Nivel: ").lower().strip()
+
+        self.print_tutor(f"Nivel seleccionado: {level}")
+        print()
+
+        self.print_tutor("¿Cuántas semanas tienes disponibles? (2-16)")
+        weeks_input = self.get_input("Semanas: ").strip()
+        try:
+            weeks = int(weeks_input)
+            if not 2 <= weeks <= 16:
+                raise ValueError()
+        except ValueError:
+            self.print_error("Por favor ingresa un número entre 2 y 16")
+            return
+
+        self.print_tutor(f"Duración: {weeks} semanas")
+        print()
+
+        self.print_tutor("¿Qué stack tecnológico te interesa?")
+        self.print_info("Ejemplos: Python, JavaScript, Java, C++, web development, etc.")
+        stack = self.get_input("Stack: ").strip()
+        if not stack:
+            stack = topic  # Usar el tema como stack por defecto
+
+        self.print_tutor(f"Stack seleccionado: {stack}")
+        print()
+
+        self.print_tutor("¿Prefieres enfoque teórico o práctico? (theory/practice/balanced)")
+        focus = self.get_input("Enfoque: ").lower().strip()
+        while focus not in ["theory", "practice", "balanced", "t", "p", "b"]:
+            self.print_error("Por favor elige: theory, practice, o balanced")
+            focus = self.get_input("Enfoque: ").lower().strip()
+
+        # Normalizar respuesta
+        focus_map = {"t": "theory", "p": "practice", "b": "balanced"}
+        focus = focus_map.get(focus, focus)
+
+        self.print_tutor(f"Enfoque: {focus}")
+        print()
+
+        # Generar syllabus usando Ollama
+        self.print_info("🤖 Generando syllabus con IA local...")
+        
+        # Verificar si Ollama está disponible
+        try:
+            ollama_status = await self.content_generator.check_ollama()
+            if not ollama_status.get("ok", False):
+                self.print_error("Ollama no está disponible. Generando curso básico...")
+                course_data = self._generate_basic_syllabus(topic, level, weeks, stack, focus)
+            else:
+                # Verificar si el modelo está disponible
+                available_models = ollama_status.get("data", {}).get("models", [])
+                model_names = [m.get("name", "") for m in available_models]
+                if self.ollama_model not in model_names:
+                    self.print_error(f"Modelo '{self.ollama_model}' no encontrado. Modelos disponibles: {', '.join(model_names[:5])}")
+                    self.print_info("Generando curso básico como alternativa...")
+                    course_data = self._generate_basic_syllabus(topic, level, weeks, stack, focus)
+                else:
+                    course_data = await self.content_generator.generate_syllabus(
+                        topic=topic,
+                        level=level,
+                        duration=f"{weeks} semanas",
+                        focus=focus
+                    )
+        except Exception as e:
+            self.print_error(f"Error generando syllabus: {e}")
+            self.print_info("Generando curso básico como alternativa...")
+            course_data = self._generate_basic_syllabus(topic, level, weeks, stack, focus)
+        
+
+        # Confirmar creación
+        confirm = self.get_input("¿Crear este curso? (y/n): ").lower().strip()
+        if confirm not in ["y", "yes", "s", "si"]:
+            self.print_info("Creación cancelada.")
+            return
+
+        # Crear el curso en disco
+        try:
+            from ..core.course import Course, CourseMetadata, Unit, Lab
+            
+            # Crear metadata
+            metadata = CourseMetadata(
+                title=course_data.get("title", topic),
+                description=course_data.get("description", ""),
+                level=level,
+                estimated_total_time=weeks * 7 * 60,  # semanas * 7 días * 60 min/día
+                stack=[stack] if stack else [],
+                learning_objectives=course_data.get("learning_objectives", []),
+                prerequisites=course_data.get("prerequisites", [])
+            )
+            
+            # Crear unidades
+            units = []
+            for i, unit_data in enumerate(course_data.get("units", []), 1):
+                labs = []
+                for lab_data in unit_data.get("labs", []):
+                    labs.append(
+                        Lab(
+                            slug=lab_data.get("slug", f"lab-{i:02d}"),
+                            title=lab_data.get("title", f"Lab {i}"),
+                            description=lab_data.get("description", ""),
+                            difficulty=lab_data.get("difficulty", "medium"),
+                            estimated_time=lab_data.get("estimated_time", 30),
+                            skills=lab_data.get("skills", []),
+                        )
+                    )
+
+                unit = Unit(
+                    number=i,
+                    slug=unit_data.get("slug", f"unit-{i}"),
+                    title=unit_data.get("title", f"Unidad {i}"),
+                    description=unit_data.get("description", ""),
+                    learning_objectives=unit_data.get("learning_objectives", []),
+                    estimated_time=unit_data.get("estimated_time", 60),
+                    skills=unit_data.get("skills", []),
+                    labs=labs,
+                )
+                units.append(unit)
+            
+            # Crear objeto Course
+            course = Course(
+                slug=course_data.get("slug", topic.lower().replace(" ", "-")),
+                metadata=metadata,
+                units=units
+            )
+            
+            self.persistence.create_course(course)
+            self.print_success(f"✅ Curso '{course.metadata.title}' creado exitosamente!")
+            self.print_info(f"Slug: {course.slug}")
+            self.print_info(f"Ubicación: {course.path}")
+            print()
+
+            # Cargar el curso
+            await self.load_course(course.slug)
+
+        except Exception as e:
+            self.print_error(f"Error creando curso: {e}")
+
+    def _generate_basic_syllabus(self, topic: str, level: str, weeks: int, stack: str, focus: str) -> dict:
+        """Generar un syllabus básico cuando Ollama no está disponible."""
+        # Crear estructura básica del curso
+        units = []
+        
+        # Definir unidades básicas según el nivel
+        if level == "beginner":
+            unit_templates = [
+                {
+                    "slug": "introduccion",
+                    "title": f"Introducción a {topic}",
+                    "description": f"Conceptos básicos y fundamentos de {topic}",
+                    "objectives": [f"Comprender los conceptos básicos de {topic}", "Instalar el entorno de desarrollo"],
+                    "labs": [
+                        {
+                            "slug": "setup-entorno",
+                            "title": "Configuración del entorno",
+                            "description": "Instalar y configurar las herramientas necesarias",
+                            "difficulty": "easy",
+                            "estimated_time": 30
+                        }
+                    ]
+                },
+                {
+                    "slug": "primeros-pasos",
+                    "title": "Primeros pasos",
+                    "description": "Tu primera aplicación práctica",
+                    "objectives": [f"Crear tu primera aplicación en {topic}", "Comprender la estructura básica"],
+                    "labs": [
+                        {
+                            "slug": "hola-mundo",
+                            "title": "Hola Mundo",
+                            "description": "Crear tu primera aplicación",
+                            "difficulty": "easy",
+                            "estimated_time": 45
+                        }
+                    ]
+                }
+            ]
+        elif level == "intermediate":
+            unit_templates = [
+                {
+                    "slug": "conceptos-avanzados",
+                    "title": f"Conceptos avanzados de {topic}",
+                    "description": f"Profundizar en {topic} con conceptos intermedios",
+                    "objectives": [f"Aplicar conceptos avanzados de {topic}", "Resolver problemas complejos"],
+                    "labs": [
+                        {
+                            "slug": "proyecto-medio",
+                            "title": "Proyecto intermedio",
+                            "description": "Aplicar conocimientos en un proyecto real",
+                            "difficulty": "medium",
+                            "estimated_time": 90
+                        }
+                    ]
+                }
+            ]
+        else:  # advanced
+            unit_templates = [
+                {
+                    "slug": "arquitectura-avanzada",
+                    "title": f"Arquitectura avanzada en {topic}",
+                    "description": f"Patrones y arquitecturas avanzadas para {topic}",
+                    "objectives": [f"Implementar patrones de diseño avanzados", "Optimizar rendimiento"],
+                    "labs": [
+                        {
+                            "slug": "proyecto-avanzado",
+                            "title": "Proyecto avanzado",
+                            "description": "Desarrollar una aplicación compleja con mejores prácticas",
+                            "difficulty": "hard",
+                            "estimated_time": 120
+                        }
+                    ]
+                }
+            ]
+        
+        # Crear unidades
+        for i, template in enumerate(unit_templates, 1):
+            unit = {
+                "number": i,
+                "slug": template["slug"],
+                "title": template["title"],
+                "description": template["description"],
+                "learning_objectives": template["objectives"],
+                "estimated_time": 60,
+                "prerequisites": [],
+                "skills": [f"{topic} {level}"],
+                "labs": template["labs"]
+            }
+            units.append(unit)
+        
+        # Crear estructura del curso
+        course_data = {
+            "title": f"Curso de {topic} - Nivel {level}",
+            "description": f"Aprende {topic} desde cero hasta nivel {level}. Este curso cubre los fundamentos y conceptos avanzados con enfoque práctico.",
+            "level": level,
+            "category": "programming",
+            "estimated_total_time": weeks * 40,  # 40 horas por semana
+            "prerequisites": [],
+            "learning_objectives": [
+                f"Comprender los conceptos fundamentales de {topic}",
+                f"Desarrollar habilidades prácticas en {topic}",
+                "Aplicar conocimientos en proyectos reales"
+            ],
+            "stack": [stack] if stack != topic else [topic],
+            "tags": [topic.lower(), level, stack.lower()],
+            "units": units
+        }
+        
+        return course_data
+
+    def _generate_basic_material(self, unit) -> str:
+        """Generar material básico para una unidad cuando Ollama no está disponible."""
+        material = f"""# Unidad {unit.number}: {unit.title}
+
+## Descripción
+{unit.description}
+
+## Objetivos de Aprendizaje
+"""
+        
+        for i, objective in enumerate(unit.learning_objectives, 1):
+            material += f"{i}. {objective}\n"
+        
+        material += f"""
+
+## Contenido Principal
+
+### Introducción
+Esta unidad cubre los conceptos fundamentales de {unit.title.lower()}.
+
+### Conceptos Clave
+- Concepto 1: Descripción básica
+- Concepto 2: Explicación detallada
+- Concepto 3: Ejemplos prácticos
+
+### Ejemplos Prácticos
+```python
+# Ejemplo básico
+print("Hola, mundo!")
+```
+
+### Errores Comunes
+1. Error típico 1: Cómo evitarlo
+2. Error típico 2: Solución recomendada
+
+### Checklist de Aprendizaje
+- [ ] Entender los conceptos básicos
+- [ ] Practicar con ejemplos
+- [ ] Resolver problemas relacionados
+- [ ] Completar los labs de práctica
+
+## Próximos Pasos
+Una vez completada esta unidad, podrás:
+- Aplicar los conceptos aprendidos
+- Resolver problemas más complejos
+- Avanzar a la siguiente unidad
+
+## Recursos Adicionales
+- Documentación oficial
+- Tutoriales en línea
+- Comunidad de desarrolladores
+
+---
+*Material generado automáticamente. Para contenido más detallado, configura Ollama.*
+"""
+        
+        return material
+
+    def show_welcome(self) -> None:
+        """Mostrar mensaje de bienvenida."""
+        self.print_logo()
+        self.print_header()
+        self.print_info("Escribe tu pregunta directamente o usa /comando para acciones específicas")
+        self.print_info("Ejemplos: '¿Qué es React?' o '/help' para ver todos los comandos")
+        print()
+
+    async def run(self) -> None:
+        """Ejecutar la aplicación."""
+        self.show_welcome()
+
+        while True:
+            try:
+                command = self.get_input()
+                if not command:
+                    continue
+
+                await self.process_command(command)
+
+            except KeyboardInterrupt:
+                print("\n\033[33m¡Hasta luego!\033[0m")
+                break
+            except Exception as e:
+                self.print_error(f"Error: {e}")
+                continue
+
+    async def process_command(self, command: str) -> None:
+        """Procesar comando del usuario."""
+        # Si no empieza con /, tratar como pregunta al tutor
+        if not command.startswith('/'):
+            await self.cmd_ask([command])
+            return
+
+        # Remover el / y procesar como comando
+        command = command[1:]
+        parts = command.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+
+        # Comandos disponibles
+        handlers = {
+            "help": self.cmd_help,
+            "new": self.cmd_new,
+            "resume": self.cmd_resume,
+            "list": self.cmd_list,
+            "quit": self.cmd_quit,
+            "exit": self.cmd_quit,
+            "q": self.cmd_quit,
+            "unit": self.cmd_unit,
+            "read": self.cmd_read,
+            "ask": self.cmd_ask,
+            "quiz": self.cmd_quiz,
+            "lab": self.cmd_lab,
+            "edit": self.cmd_edit,
+            "submit": self.cmd_submit,
+            "progress": self.cmd_progress,
+            "export": self.cmd_export,
+            "import": self.cmd_import,
+            "delete": self.cmd_delete,
+            "model": self.cmd_model,
+        }
+
+        handler = handlers.get(cmd)
+        if handler:
+            await handler(args)
+        else:
+            self.print_error(f"Comando desconocido: {cmd}")
+            self.print_info("Escribe '/help' para ver los comandos disponibles")
+
+    async def cmd_resume(self, args) -> None:
+        """Listar y reanudar cursos existentes."""
         courses = self.persistence.list_courses()
 
         if not courses:
-            log.write_info("No hay cursos guardados. Usa 'new' para crear uno.")
+            self.print_info("No hay cursos guardados. Usa 'new' para crear uno.")
             return
 
-        log.write("[bold]Cursos disponibles:[/bold]\n")
+        print("\033[32m📚 Cursos disponibles:\033[0m")
         for i, course in enumerate(courses, 1):
-            status = "[green]●[/green]" if course["has_state"] else "[dim]○[/dim]"
-            log.write(f"  {status} {i}. [bold]{course['title']}[/bold] ({course['slug']}) - {course['level']}")
+            status_icon = "\033[32m●\033[0m" if course["has_state"] else "\033[37m○\033[0m"
+            progress = f" ({course.get('progress', 0)}%)" if course.get("progress") else ""
+            print(f"  {status_icon} {i}. \033[33m{course['title']}\033[0m ({course['slug']}) - {course['level']}{progress}")
+
+        print()
 
         if len(args) >= 1:
-            # Cargar curso específico
             selection = args[0]
             try:
                 idx = int(selection) - 1
                 if 0 <= idx < len(courses):
                     await self.load_course(courses[idx]["slug"])
                 else:
-                    log.write_error("Número de curso inválido")
+                    self.print_error("Número de curso inválido")
             except ValueError:
-                # Buscar por slug
-                await self.load_course(selection)
+                # Intentar cargar por slug
+                matching_courses = [c for c in courses if c["slug"] == selection]
+                if matching_courses:
+                    await self.load_course(selection)
+                else:
+                    self.print_error(f"Curso '{selection}' no encontrado")
         else:
-            log.write_info("Escribe 'resume <número>' o 'resume <slug>' para cargar")
+            self.print_info("Usa 'resume <número>' o 'resume <slug>' para cargar un curso")
+            self.print_info("O simplemente 'resume' para ver la lista")
 
-    async def cmd_list(self, args: list[str]) -> None:
-        """Listar cursos."""
-        await self.cmd_resume(args)
+    async def cmd_quit(self, args) -> None:
+        """Salir."""
+        self.print_success("¡Hasta luego!")
+        sys.exit(0)
 
-    async def cmd_quit(self, args: list[str]) -> None:
-        """Salir de la aplicación."""
-        self.exit()
-
-    async def cmd_unit(self, args: list[str]) -> None:
-        """Cambiar de unidad."""
-        log = self.get_output_log()
-
+    async def cmd_unit(self, args) -> None:
+        """Cambiar a una unidad específica."""
         if not self.current_course:
-            log.write_error("No hay curso activo. Usa 'resume' primero.")
+            self.print_error("No hay curso cargado. Usa 'resume' para cargar uno.")
             return
 
         if not args:
-            # Listar unidades
-            log.write(f"[bold]Unidades en {self.current_course.metadata.title}:[/bold]\n")
-            for unit in self.current_course.units:
-                log.write(f"  {unit.number}. [bold]{unit.title}[/bold]")
-            log.write_info("Escribe 'unit <n>' para cambiar de unidad")
+            self.print_error("Especifica el número de unidad. Ejemplo: unit 1")
             return
 
         try:
             unit_num = int(args[0])
-            unit = self.current_course.get_unit(unit_num)
-            if unit:
-                if self.current_state:
-                    self.current_state.current_unit = unit_num
-                    self.persistence.save_state(self.current_state)
-                self.update_status()
-                log.write_success(f"Unidad cambiada a: {unit.title}")
-                log.write_info("Escribe 'read' para ver el material")
-            else:
-                log.write_error(f"Unidad {unit_num} no existe")
         except ValueError:
-            log.write_error("Número de unidad inválido")
-
-    async def cmd_read(self, args: list[str]) -> None:
-        """Leer material de la unidad actual."""
-        log = self.get_output_log()
-
-        if not self.current_course or not self.current_state:
-            log.write_error("No hay curso activo")
+            self.print_error("Número de unidad inválido")
             return
 
-        unit = self.current_course.get_current_unit(self.current_state)
-        if not unit:
-            log.write_error("No hay unidad activa")
+        if not 1 <= unit_num <= len(self.current_course.units):
+            self.print_error(f"Unidad {unit_num} no existe. Hay {len(self.current_course.units)} unidades.")
             return
 
-        if unit.material_path and unit.material_path.exists():
-            content = unit.material_path.read_text(encoding="utf-8")
-            log.write(f"\n[bold cyan]{'='*60}[/bold cyan]")
-            log.write(f"[bold cyan]  {unit.title}[/bold cyan]")
-            log.write(f"[bold cyan]{'='*60}[/bold cyan]\n")
-            # Mostrar primeras 50 líneas por ahora
-            lines = content.split("\n")[:50]
-            log.write("\n".join(lines))
-            if len(content.split("\n")) > 50:
-                log.write("\n[yellow]... (usa 'read' para ver más o abre el archivo directamente)[/yellow]")
-        else:
-            log.write_error(f"Material no encontrado: {unit.material_path}")
+        # Cambiar unidad
+        self.current_unit = self.current_course.units[unit_num - 1]
+        self.current_state.current_unit = unit_num
 
-    async def cmd_ask(self, args: list[str]) -> None:
-        """Preguntar al tutor con contexto del material."""
-        log = self.get_output_log()
-        question = " ".join(args)
+        # Marcar como iniciada si no lo estaba
+        self._get_unit_progress(unit_num)
 
-        if not question:
-            log.write_info("Escribe 'ask <tu pregunta>' para consultar al tutor")
-            return
-
-        if not self.current_course or not self.current_state:
-            log.write_info("No hay curso activo. El tutor responderá sin contexto específico.")
-
-        # Verificar Ollama
-        try:
-            status = await self.content_generator.check_ollama()
-            if not status.get("ok"):
-                log.write_error("Ollama no está disponible. No se puede consultar al tutor.")
-                log.write_info("Asegúrate de que Ollama esté corriendo")
-                return
-        except Exception:
-            log.write_error("Error verificando Ollama")
-            return
-
-        # Preparar contexto
-        context = ""
-        unit_title = "N/A"
-        unit_desc = "N/A"
-
-        if self.current_course and self.current_state:
-            unit = self.current_course.get_current_unit(self.current_state)
-            if unit and unit.material_path and unit.material_path.exists():
-                # Leer material y extraer contexto relevante
-                material = unit.material_path.read_text(encoding="utf-8")
-                # Extraer párrafos relevantes (heurística simple: buscar keywords)
-                keywords = question.lower().split()
-                relevant_lines = []
-                for line in material.split("\n")[:100]:  # Limitar a primeras 100 líneas
-                    line_lower = line.lower()
-                    if any(kw in line_lower for kw in keywords if len(kw) > 3):
-                        relevant_lines.append(line)
-
-                context = "\n".join(relevant_lines[:20])  # Top 20 líneas relevantes
-                unit_title = unit.title
-                unit_desc = unit.description
-
-        # Construir mensajes para Ollama
-        from ..llm.client import Message
-        from ..llm.prompts import TUTOR_SYSTEM
-
-        system_prompt = TUTOR_SYSTEM.format(
-            course_title=self.current_course.metadata.title if self.current_course else "Curso General",
-            unit_title=unit_title,
-            unit_description=unit_desc,
-        )
-
-        user_prompt = f"""Contexto del material:
-{context[:1500]}
-
-Pregunta del estudiante: {question}"""
-
-        log.write_tutor("Pensando...")
-
-        self.set_loading(True)
-        try:
-            messages = [
-                Message(role="system", content=system_prompt),
-                Message(role="user", content=user_prompt),
-            ]
-
-            response = await self.content_generator.client.chat(
-                messages=messages,
-                temperature=0.7,
-            )
-
-            # Mostrar respuesta
-            log.write(f"\n[cyan bold]Tutor:[/cyan bold]")
-            log.write(response.content)
-
-            # Guardar en historial
-            if self.current_course and self.current_state:
-                self.current_state.add_chat_message("user", question)
-                self.current_state.add_chat_message("assistant", response.content)
-                self.persistence.save_state(self.current_state)
-
-        except Exception as e:
-            log.write_error(f"Error consultando al tutor: {e}")
-        finally:
-            self.set_loading(False)
-
-    async def cmd_quiz(self, args: list[str]) -> None:
-        """Iniciar quiz interactivo."""
-        import json
-        log = self.get_output_log()
-
-        if not self.current_course or not self.current_state:
-            log.write_error("No hay curso activo")
-            return
-
-        unit = self.current_course.get_current_unit(self.current_state)
-        if not unit:
-            log.write_error("No hay unidad activa")
-            return
-
-        # Cargar preguntas
-        if not unit.quiz_path or not unit.quiz_path.exists():
-            log.write_error("Esta unidad no tiene quiz")
-            return
-
-        try:
-            questions = json.loads(unit.quiz_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, FileNotFoundError) as e:
-            log.write_error(f"Error cargando quiz: {e}")
-            return
-
-        if not questions:
-            log.write_error("El quiz está vacío")
-            return
-
-        log.write(f"\n[bold cyan]Quiz: {unit.title}[/bold cyan]")
-        log.write(f"{len(questions)} preguntas\n")
-
-        # Estado del quiz
-        progress = self.current_state.get_or_create_unit_progress(unit.number)
-        current_q = 0
-        score = 0
-
-        while current_q < len(questions):
-            q = questions[current_q]
-            q_id = q.get("id", f"q{current_q}")
-            q_text = q.get("question", "Pregunta sin texto")
-            q_type = q.get("type", "multiple_choice")
-            options = q.get("options", [])
-            correct = q.get("correct_answer", "")
-            explanation = q.get("explanation", "")
-            hint = q.get("hint", "")
-
-            log.write(f"\n[bold]Pregunta {current_q + 1}/{len(questions)}:[/bold]")
-            log.write(f"{q_text}\n")
-
-            if q_type == "multiple_choice" and options:
-                for i, opt in enumerate(options):
-                    opt_text = opt.get("text", f"Opción {i+1}")
-                    log.write(f"  {chr(97+i)}) {opt_text}")
-
-            # Esperar respuesta del usuario
-            log.write_info("\nEscribe tu respuesta (a, b, c...) o 'hint' para pista")
-            log.write_info("Para terminar, escribe 'quiz_stop'")
-
-            self.pending_action = "quiz_answer"
-            self.pending_data = {
-                "question_idx": current_q,
-                "question": q,
-                "score": score,
-                "questions": questions,
-                "progress": progress,
-            }
-            return  # Pausar y esperar respuesta
-
-        # Calcular resultado final
-        final_score = (score / len(questions) * 100) if questions else 0
-        log.write(f"\n[bold cyan]Quiz completado[/bold cyan]")
-        log.write(f"Puntuación: {final_score:.0f}% ({score}/{len(questions)})")
-
-        # Guardar resultado
-        from ..core.state import QuizResult
-        quiz_result = QuizResult(
-            question_id="final",
-            correct=final_score >= 70,
-            answer=f"{score}/{len(questions)}",
-            score=final_score / 100,
-        )
-        progress.quiz_results.append(quiz_result)
         self.persistence.save_state(self.current_state)
+        
+        self.print_success(f"Unidad {unit_num}: {self.current_unit.title}")
+        self.print_info("Usa 'read' para ver el material")
 
-        if final_score >= 70:
-            log.write_success("¡Buen trabajo! Has dominado los conceptos de esta unidad.")
-        else:
-            log.write_info("Sigue practicando. Revisa el material con 'read' y vuelve a intentarlo.")
-
-    async def cmd_lab(self, args: list[str]) -> None:
-        """Gestionar labs."""
-        log = self.get_output_log()
-
-        if not self.current_course or not self.current_state:
-            log.write_error("No hay curso activo")
+    async def cmd_read(self, args) -> None:
+        """Leer material de la unidad actual."""
+        if not self.current_course or not self.current_unit:
+            self.print_error("No hay unidad seleccionada. Usa '/unit <n>' para seleccionar una.")
             return
 
-        unit = self.current_course.get_current_unit(self.current_state)
-        if not unit:
-            log.write_error("No hay unidad activa")
-            return
-
-        if not unit.labs:
-            log.write_info("Esta unidad no tiene labs prácticos")
-            return
-
-        if not args:
-            # Listar labs
-            log.write(f"[bold]Labs en {unit.title}:[/bold]\n")
-            for lab in unit.labs:
-                status = ""
-                if self.current_state:
-                    progress = self.current_state.get_or_create_unit_progress(unit.number)
-                    result = progress.lab_results.get(lab.slug)
-                    if result:
-                        status_map = {
-                            "not_started": "[dim]○[/dim]",
-                            "in_progress": "[yellow]◐[/yellow]",
-                            "submitted": "[blue]●[/blue]",
-                            "passed": "[green]✓[/green]",
-                            "failed": "[red]✗[/red]",
-                        }
-                        status = f" {status_map.get(result.status, '○')}"
-                log.write(f"  {status} [bold]{lab.slug}[/bold]: {lab.title} ({lab.difficulty})")
-            log.write_info("Escribe 'lab <slug>' o 'lab <número>' para seleccionar")
-        else:
-            # Seleccionar lab
-            selection = args[0]
-            lab = None
-
-            # Buscar por número
+        material_path = self.current_unit.material_path
+        if not material_path or not material_path.exists():
+            self.print_info("Material no encontrado. Generando...")
+            
+            # Generar material usando IA o fallback
             try:
-                idx = int(selection) - 1
-                if 0 <= idx < len(unit.labs):
-                    lab = unit.labs[idx]
-            except ValueError:
-                # Buscar por slug
-                for l in unit.labs:
-                    if l.slug == selection:
-                        lab = l
+                # Verificar si Ollama está disponible
+                ollama_available = False
+                try:
+                    status = await self.content_generator.check_ollama()
+                    ollama_available = status.get("ok", False)
+                except Exception:
+                    ollama_available = False
+
+                if ollama_available:
+                    self.print_info("Generando material con IA...")
+                    material_content = await self.content_generator.generate_unit_material(
+                        self.current_course, self.current_unit
+                    )
+                else:
+                    # Generar material básico
+                    self.print_info("Generando material básico...")
+                    material_content = self._generate_basic_material(self.current_unit)
+
+                # Guardar el material
+                material_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(material_path, "w", encoding="utf-8") as f:
+                    f.write(material_content)
+                
+                self.print_success("Material generado exitosamente!")
+                
+            except Exception as e:
+                self.print_error(f"Error generando material: {e}")
+                return
+
+        # Leer y mostrar material con paginación simple
+        try:
+            with open(material_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Mostrar en páginas
+            lines = content.split('\n')
+            page_size = 30
+            total_pages = (len(lines) - 1) // page_size + 1
+            
+            for page in range(total_pages):
+                start_line = page * page_size
+                end_line = min((page + 1) * page_size, len(lines))
+                
+                print(f"\033[36m=== Unidad {self.current_unit.number}: {self.current_unit.title} (Página {page+1}/{total_pages}) ===\033[0m")
+                print()
+                
+                for line in lines[start_line:end_line]:
+                    print(line)
+                
+                print()
+                
+                if page < total_pages - 1:
+                    response = self.get_input("Presiona Enter para continuar, 'q' para salir: ")
+                    if response.lower() in ['q', 'quit']:
                         break
 
-            if lab:
-                if self.current_state:
-                    self.current_state.current_lab = lab.slug
-                    self.persistence.save_state(self.current_state)
-                log.write_success(f"Lab seleccionado: {lab.title}")
-                log.write_info("Escribe 'edit' para abrir el editor o 'read' para ver el README")
-            else:
-                log.write_error(f"Lab no encontrado: {selection}")
+            # Marcar como leído
+            progress = self._get_unit_progress(self.current_unit.number)
+            if progress:
+                progress.material_read = True
+                progress.status = progress.status or "reading"
 
-    async def cmd_edit(self, args: list[str]) -> None:
-        """Abrir editor en el lab."""
-        import os
-        log = self.get_output_log()
+            self.persistence.save_state(self.current_state)
+            
+        except Exception as e:
+            self.print_error(f"Error leyendo material: {e}")
 
+    def _generate_basic_material(self, unit) -> str:
+        """Generar material básico para una unidad."""
+        content = f"""# Unidad {unit.number}: {unit.title}
+
+## Descripción
+{unit.description}
+
+## Objetivos de Aprendizaje
+"""
+        
+        for i, objective in enumerate(unit.learning_objectives, 1):
+            content += f"{i}. {objective}\n"
+        
+        content += f"""
+## Contenido Principal
+
+### Introducción
+Esta unidad cubre los conceptos fundamentales de {unit.title.lower()}.
+
+### Conceptos Clave
+- Concepto 1: Descripción básica
+- Concepto 2: Explicación detallada
+- Concepto 3: Ejemplos prácticos
+
+### Ejemplos Prácticos
+```python
+# Ejemplo básico
+print("Hola, mundo!")
+```
+
+### Errores Comunes
+1. Error típico 1: Cómo evitarlo
+2. Error típico 2: Solución recomendada
+
+### Checklist de Aprendizaje
+- [ ] Entender los conceptos básicos
+- [ ] Practicar con ejemplos
+- [ ] Resolver problemas relacionados
+- [ ] Completar los labs de práctica
+
+## Próximos Pasos
+Una vez completada esta unidad, podrás:
+- Aplicar los conceptos aprendidos
+- Resolver problemas más complejos
+- Avanzar a la siguiente unidad
+
+## Recursos Adicionales
+- Documentación oficial
+- Tutoriales en línea
+- Comunidad de desarrolladores
+
+---
+*Material generado automáticamente. Para contenido más detallado, configura Ollama.*
+"""
+        return content
+
+    def _ensure_unit_progress_dict(self) -> None:
+        """Asegurar que unit_progress sea un diccionario."""
+        if not self.current_state:
+            return
+        if isinstance(self.current_state.unit_progress, dict):
+            return
+
+        from ..core.state import UnitProgress
+
+        new_progress: dict[int, UnitProgress] = {}
+        for item in self.current_state.unit_progress:
+            if isinstance(item, UnitProgress):
+                new_progress[item.unit_number] = item
+            elif isinstance(item, dict):
+                progress = UnitProgress.from_dict(item)
+                new_progress[progress.unit_number] = progress
+
+        self.current_state.unit_progress = new_progress
+
+    def _get_unit_progress(self, unit_number: int):
+        """Obtener o crear progreso de unidad."""
+        if not self.current_state:
+            return None
+
+        self._ensure_unit_progress_dict()
+        from ..core.state import UnitProgress
+
+        progress = self.current_state.unit_progress.get(unit_number)
+        if progress is None:
+            progress = UnitProgress(unit_number=unit_number)
+            self.current_state.unit_progress[unit_number] = progress
+        return progress
+
+    def _get_unit_path(self, unit) -> Path:
+        """Obtener ruta física de la unidad."""
+        if self.current_course and self.current_course.path:
+            course_path = self.current_course.path
+        elif self.current_course:
+            course_path = self.persistence.get_course_path(self.current_course.slug)
+        else:
+            raise ValueError("No hay curso cargado")
+
+        unit_slug = f"{unit.number:02d}-{unit.slug}"
+        return course_path / "units" / unit_slug
+
+    def _ensure_lab_structure(self, unit_path: Path, lab_slug: str, lab_title: str) -> Path:
+        """Crear estructura de lab si no existe."""
+        lab_path = unit_path / "labs" / lab_slug
+        lab_path.mkdir(parents=True, exist_ok=True)
+        (lab_path / "starter").mkdir(exist_ok=True)
+        (lab_path / "submission").mkdir(exist_ok=True)
+        (lab_path / "tests").mkdir(exist_ok=True)
+
+        readme_path = lab_path / "README.md"
+        if not readme_path.exists():
+            readme_content = f"""# {lab_title}
+
+## Objetivo
+Completar el ejercicio práctico relacionado con la unidad actual.
+
+## Instrucciones
+1. Revisa el material de la unidad con `/read`.
+2. Implementa la solución en la carpeta `submission/`.
+3. Ejecuta `/submit` para evaluar tu solución.
+
+## Criterios de evaluación
+- Correctitud de la solución
+- Calidad del código
+- Cumplimiento de requisitos
+"""
+            readme_path.write_text(readme_content, encoding="utf-8")
+
+        grade_path = lab_path / "grade.json"
+        if not grade_path.exists():
+            grade_path.write_text("{}", encoding="utf-8")
+
+        return lab_path
+
+    async def cmd_progress(self, args) -> None:
+        """Mostrar progreso del curso."""
         if not self.current_course or not self.current_state:
-            log.write_error("No hay curso activo")
+            self.print_error("No hay curso cargado.")
             return
 
-        unit = self.current_course.get_current_unit(self.current_state)
-        if not unit:
-            log.write_error("No hay unidad activa")
+        print(f"\033[32m📊 Progreso de '{self.current_course.metadata.title}'\033[0m")
+        print()
+
+        self._ensure_unit_progress_dict()
+        total_units = len(self.current_course.units)
+        completed_units = sum(
+            1 for up in self.current_state.unit_progress.values() if up.status == "completed"
+        )
+        overall_progress = (completed_units / total_units * 100) if total_units > 0 else 0
+
+        print(f"\033[33mProgreso general: {overall_progress:.1f}%\033[0m ({completed_units}/{total_units} unidades)")
+        print()
+
+        for unit in self.current_course.units:
+            progress = self.current_state.unit_progress.get(unit.number)
+            
+            if progress:
+                status_icon = {
+                    "not_started": "○",
+                    "reading": "📖",
+                    "practicing": "💻", 
+                    "completed": "✅"
+                }.get(progress.status, "○")
+                
+                status_color = {
+                    "not_started": "\033[37m",
+                    "reading": "\033[36m",
+                    "practicing": "\033[33m",
+                    "completed": "\033[32m"
+                }.get(progress.status, "\033[37m")
+                
+                material_status = "📄" if progress.material_read else "📭"
+                quiz_count = len(progress.quiz_results)
+                lab_count = len(progress.lab_results)
+                
+                print(f"  {status_color}{status_icon}\033[0m Unidad {unit.number}: {unit.title}")
+                print(f"    {material_status} Material leído: {'Sí' if progress.material_read else 'No'}")
+                print(f"    🧠 Quizzes completados: {quiz_count}")
+                print(f"    💻 Labs completados: {lab_count}")
+                if progress.completed_at:
+                    print(f"    ✅ Completada: {progress.completed_at.strftime('%Y-%m-%d')}")
+                print()
+            else:
+                print(f"  \033[37m○\033[0m Unidad {unit.number}: {unit.title} (no iniciada)")
+                print()
+
+    async def load_course(self, slug: str) -> None:
+        """Cargar curso y su estado."""
+        try:
+            # Cargar curso
+            self.current_course = self.persistence.load_course(slug)
+            
+            # Cargar estado
+            self.current_state = self.persistence.load_state(slug)
+            if self.current_state is None:
+                # Crear estado inicial si no existe
+                from ..core.state import CourseState
+                self.current_state = CourseState(course_slug=slug)
+                self.persistence.save_state(self.current_state)
+            
+            # Normalizar estado
+            self._ensure_unit_progress_dict()
+
+            # Establecer unidad actual
+            if self.current_state.current_unit > 0 and self.current_state.current_unit <= len(self.current_course.units):
+                self.current_unit = self.current_course.units[self.current_state.current_unit - 1]
+            else:
+                self.current_unit = self.current_course.units[0] if self.current_course.units else None
+            
+            self.print_success(f"Curso '{self.current_course.metadata.title}' cargado!")
+            self.print_info(f"Unidad actual: {self.current_unit.title if self.current_unit else 'Ninguna'}")
+            
+        except Exception as e:
+            self.print_error(f"Error cargando curso: {e}")
+            self.current_course = None
+            self.current_state = None
+            self.current_unit = None
+
+
+    async def cmd_ask(self, args) -> None:
+        """Preguntar al tutor sobre el material actual."""
+        question = " ".join(args) if args else ""
+        
+        if not question:
+            self.print_error("¿Qué quieres preguntarle al tutor?")
             return
 
-        # Verificar que hay un lab seleccionado
-        if not self.current_state.current_lab:
-            log.write_error("No hay lab seleccionado. Usa 'lab' primero.")
+        if not self.current_course or not self.current_unit:
+            self.print_error("No hay unidad seleccionada. Usa '/unit <n>' para seleccionar una.")
             return
 
-        # Encontrar el lab
-        lab = None
-        for l in unit.labs:
-            if l.slug == self.current_state.current_lab:
-                lab = l
+        # Obtener contexto del material actual
+        context = ""
+        if self.current_unit.material_path and self.current_unit.material_path.exists():
+            try:
+                with open(self.current_unit.material_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    # Tomar los primeros 2000 caracteres como contexto
+                    context = content[:2000] + "..." if len(content) > 2000 else content
+            except Exception:
+                context = "No se pudo cargar el contexto del material."
+
+        # Preparar el prompt para el tutor
+        system_prompt = f"""Eres un tutor experto en {self.current_course.metadata.title}.
+Estás enseñando la unidad "{self.current_unit.title}" a un estudiante de nivel {self.current_course.metadata.level}.
+
+Contexto del material actual:
+{context}
+
+Responde de manera pedagógica, clara y concisa. Si la pregunta no está relacionada con el material actual, redirígela al tema correspondiente.
+Adapta tu respuesta al nivel del estudiante."""
+
+        user_prompt = f"Pregunta del estudiante: {question}"
+
+        try:
+            self.print_tutor("Pensando...")
+            
+            # Verificar si Ollama está disponible
+            ollama_available = False
+            try:
+                from ..llm.client import OllamaClient
+                client = OllamaClient()
+                status = await client.check_connection()
+                ollama_available = status.get("ok", False)
+            except:
+                ollama_available = False
+
+            if not ollama_available:
+                # Respuesta básica sin IA
+                self.print_tutor("Lo siento, no tengo acceso a IA en este momento. Te recomiendo revisar el material de la unidad actual con '/read' o cambiar a otra unidad con '/unit <n>'.")
+                return
+
+            # Crear cliente LLM
+            from ..llm.client import OllamaClient, Message
+            client = OllamaClient()
+            
+            response = await client.chat(
+                messages=[
+                    Message(role="system", content=system_prompt),
+                    Message(role="user", content=user_prompt)
+                ]
+            )
+            
+            self.print_tutor(response.content)
+            
+        except Exception as e:
+            self.print_error(f"Error consultando al tutor: {e}")
+            self.print_info("Asegúrate de que Ollama esté ejecutándose en localhost:11434")
+
+    def show_welcome(self) -> None:
+        """Mostrar mensaje de bienvenida."""
+        self.print_logo()
+        self.print_header()
+        self.print_info("Escribe cualquier pregunta para hablar con el tutor")
+        self.print_info("O usa comandos con / al inicio: /help, /new, /read, etc.")
+        print()
+
+    async def run(self) -> None:
+        """Ejecutar la aplicación."""
+        self.show_welcome()
+
+        while True:
+            try:
+                command = self.get_input()
+                if not command:
+                    continue
+
+                await self.process_command(command)
+
+            except KeyboardInterrupt:
+                print("\n\033[33m¡Hasta luego!\033[0m")
                 break
+            except Exception as e:
+                self.print_error(f"Error: {e}")
+                continue
 
-        if not lab:
-            log.write_error(f"Lab no encontrado: {self.current_state.current_lab}")
+    async def process_command(self, command: str) -> None:
+        """Procesar comando del usuario."""
+        # Si no empieza con /, es una pregunta al tutor
+        if not command.startswith('/'):
+            await self.cmd_ask([command])
             return
 
-        if not lab.submission_path:
-            log.write_error("Lab no tiene path de submission")
+        # Remover el / del comando
+        command = command[1:]
+        
+        parts = command.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+
+        # Comandos disponibles
+        handlers = {
+            "help": self.cmd_help,
+            "new": self.cmd_new,
+            "resume": self.cmd_resume,
+            "list": self.cmd_list,
+            "quit": self.cmd_quit,
+            "exit": self.cmd_quit,
+            "q": self.cmd_quit,
+            "unit": self.cmd_unit,
+            "read": self.cmd_read,
+            "ask": self.cmd_ask,
+            "quiz": self.cmd_quiz,
+            "lab": self.cmd_lab,
+            "edit": self.cmd_edit,
+            "submit": self.cmd_submit,
+            "progress": self.cmd_progress,
+            "export": self.cmd_export,
+            "import": self.cmd_import,
+            "delete": self.cmd_delete,
+            "model": self.cmd_model,
+        }
+
+        handler = handlers.get(cmd)
+        if handler:
+            await handler(args)
+        else:
+            self.print_error(f"Comando desconocido: {cmd}")
+            self.print_info("Escribe '/help' para ver los comandos disponibles")
+
+    # Placeholder para otros comandos
+    async def cmd_list(self, args) -> None:
+        """Listar cursos (alias de resume)."""
+        await self.cmd_resume([])
+
+    async def cmd_quiz(self, args) -> None:
+        """Ejecutar quiz de la unidad actual."""
+        if not self.current_course or not self.current_unit:
+            self.print_error("No hay unidad seleccionada. Usa '/unit <n>' para seleccionar una.")
             return
 
+        quiz_path = self.current_unit.quiz_path
+        material_path = self.current_unit.material_path
+
+        # Asegurar material
+        if not material_path or not material_path.exists():
+            self.print_info("Material no encontrado. Generando...")
+            await self.cmd_read([])
+
+        # Generar quiz si no existe
+        if not quiz_path or not quiz_path.exists():
+            try:
+                if material_path and material_path.exists():
+                    material_content = material_path.read_text(encoding="utf-8")
+                else:
+                    material_content = ""
+
+                status = await self.content_generator.check_ollama()
+                if status.get("ok", False):
+                    self.print_info("Generando quiz con IA...")
+                    quiz_data = await self.content_generator.generate_quiz(
+                        self.current_unit, material_content, n_questions=5
+                    )
+                else:
+                    quiz_data = [
+                        {
+                            "id": "q1",
+                            "question": f"¿Cuál es el objetivo principal de la unidad {self.current_unit.title}?",
+                            "options": [
+                                "Comprender los conceptos básicos",
+                                "Optimizar rendimiento",
+                                "Crear una app completa",
+                                "Ninguna de las anteriores",
+                            ],
+                            "answer": "Comprender los conceptos básicos",
+                            "explanation": "El objetivo principal suele ser dominar los fundamentos de la unidad.",
+                        }
+                    ]
+
+                quiz_path.parent.mkdir(parents=True, exist_ok=True)
+                quiz_path.write_text(
+                    json.dumps(quiz_data, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                self.print_error(f"Error generando quiz: {e}")
+                return
+
+        # Ejecutar quiz
+        try:
+            quiz_data = json.loads(quiz_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            self.print_error(f"Quiz inválido: {e}")
+            return
+
+        if not isinstance(quiz_data, list) or not quiz_data:
+            self.print_error("El quiz está vacío o tiene formato inválido")
+            return
+
+        from ..core.state import QuizResult
+
+        correct_count = 0
+        self.print_info("Iniciando quiz...")
+        for idx, q in enumerate(quiz_data, 1):
+            question = q.get("question", f"Pregunta {idx}")
+            options = q.get("options") or q.get("choices") or []
+            answer_key = q.get("answer") or q.get("correct_answer") or q.get("correct")
+
+            print(f"\033[36mQ{idx}: {question}\033[0m")
+            if options:
+                for opt_idx, opt in enumerate(options, 1):
+                    print(f"  {opt_idx}. {opt}")
+
+            user_answer = self.get_input("Respuesta: ").strip()
+
+            # Normalizar respuesta
+            if options and user_answer.isdigit():
+                opt_idx = int(user_answer) - 1
+                if 0 <= opt_idx < len(options):
+                    user_answer = options[opt_idx]
+
+            is_correct = False
+            if answer_key is not None:
+                is_correct = str(user_answer).strip().lower() == str(answer_key).strip().lower()
+
+            if is_correct:
+                correct_count += 1
+                print("\033[32m✓ Correcto\033[0m")
+            else:
+                print("\033[31m✗ Incorrecto\033[0m")
+                if answer_key is not None:
+                    print(f"Respuesta correcta: {answer_key}")
+
+            result = QuizResult(
+                question_id=str(q.get("id", idx)),
+                correct=is_correct,
+                answer=str(user_answer),
+                score=1.0 if is_correct else 0.0,
+            )
+
+            progress = self._get_unit_progress(self.current_unit.number)
+            if progress:
+                progress.quiz_results.append(result)
+
+        self.persistence.save_state(self.current_state)
+        total = len(quiz_data)
+        score_pct = (correct_count / total * 100) if total else 0
+        self.print_success(f"Quiz completado: {correct_count}/{total} ({score_pct:.1f}%)")
+
+    async def cmd_lab(self, args) -> None:
+        """Seleccionar o crear lab de la unidad actual y abrir editor."""
+        if not self.current_course or not self.current_unit:
+            self.print_error("No hay unidad seleccionada. Usa '/unit <n>' para seleccionar una.")
+            return
+
+        unit_path = self._get_unit_path(self.current_unit)
+        labs_dir = unit_path / "labs"
+        labs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Obtener labs desde el modelo o el disco
+        labs = []
+        if getattr(self.current_unit, "labs", None):
+            labs = [lab.slug for lab in self.current_unit.labs]
+        else:
+            labs = sorted([p.name for p in labs_dir.iterdir() if p.is_dir()]) if labs_dir.exists() else []
+
+        if not labs:
+            labs = ["lab-01"]
+
+        selected_lab = None
+        if args:
+            selection = args[0]
+            try:
+                idx = int(selection) - 1
+                if 0 <= idx < len(labs):
+                    selected_lab = labs[idx]
+                else:
+                    self.print_error("Número de lab inválido")
+                    return
+            except ValueError:
+                if selection in labs:
+                    selected_lab = selection
+                else:
+                    self.print_error(f"Lab '{selection}' no encontrado")
+                    return
+        else:
+            selected_lab = labs[0]
+
+        lab_title = f"Lab {selected_lab} - {self.current_unit.title}"
+        lab_path = self._ensure_lab_structure(unit_path, selected_lab, lab_title)
+
+        # Crear starter y tests básicos si no existen
+        starter_file = lab_path / "starter" / "main.py"
+        if not starter_file.exists():
+            starter_file.write_text(
+                """def solve():\n    return "ok"\n\nif __name__ == '__main__':\n    print(solve())\n""",
+                encoding="utf-8",
+            )
+
+        test_file = lab_path / "tests" / "test_main.py"
+        if not test_file.exists():
+            test_file.write_text(
+                """from submission.main import solve\n\n\ndef test_solve():\n    assert solve() == 'ok'\n""",
+                encoding="utf-8",
+            )
+
+        # Actualizar estado
+        self._ensure_unit_progress_dict()
+        self.current_state.current_lab = selected_lab
+        progress = self._get_unit_progress(self.current_unit.number)
+        if progress:
+            progress.status = "practicing"
+        self.persistence.save_state(self.current_state)
+
+        self.print_success(f"Lab seleccionado: {selected_lab}")
+        self.print_info(f"Ruta: {lab_path}")
+
+        # Abrir editor automáticamente
+        await self.cmd_edit([])
+
+    async def cmd_edit(self, args) -> None:
+        """Abrir editor en el lab actual (submission/)."""
+        if not self.current_course or not self.current_unit:
+            self.print_error("No hay unidad seleccionada. Usa '/unit <n>' primero.")
+            return
+
+        if not self.current_state or not self.current_state.current_lab:
+            self.print_error("No hay lab seleccionado. Usa '/lab' para crear o seleccionar uno.")
+            return
+
+        unit_path = self._get_unit_path(self.current_unit)
+        lab_slug = self.current_state.current_lab
+        lab_path = self._ensure_lab_structure(unit_path, lab_slug, f"Lab {lab_slug}")
+
+        from ..core.course import Lab
         from ..labs.workspace import LabWorkspace
+
+        lab = Lab(slug=lab_slug, title=f"Lab {lab_slug}", description="")
+        lab.path = lab_path
+        lab.readme_path = lab_path / "README.md"
+        lab.starter_path = lab_path / "starter"
+        lab.submission_path = lab_path / "submission"
+        lab.tests_path = lab_path / "tests"
+        lab.grade_path = lab_path / "grade.json"
 
         workspace = LabWorkspace(lab, editor=self.config.editor)
 
-        # Guardar hash para detectar cambios
-        pre_hash = workspace.get_submission_hash()
-
-        log.write_info(f"Abriendo editor en: {lab.submission_path}")
-        log.write_info("Edita los archivos, guarda y sal del editor para continuar...")
-
-        # Pausar TUI temporalmente y abrir editor
-        self.set_loading(True)
-        log.write("[dim]Editor abierto. Presiona :q para salir y continuar...[/dim]")
-
-        # Limpiar pantalla para el editor
-        if hasattr(self, 'console'):
-            self.console.clear()
-
-        # Ejecutar editor
+        self.print_info(f"Abriendo editor en {lab.submission_path}...")
         try:
-            returncode = workspace.open_editor()
-
-            if returncode != 0:
-                log.write_warning(f"El editor cerró con código: {returncode}")
-
-            # Verificar cambios
-            post_hash = workspace.get_submission_hash()
-            has_changes = pre_hash != post_hash
-
-            if has_changes:
-                log.write_success("¡Archivos modificados! Usa 'submit' para evaluar tu solución")
-
-                # Actualizar estado
-                progress = self.current_state.get_or_create_unit_progress(unit.number)
-                if lab.slug not in progress.lab_results:
-                    from ..core.state import LabResult
-                    progress.lab_results[lab.slug] = LabResult(
-                        lab_slug=lab.slug,
-                        status="in_progress",
-                    )
-                else:
-                    progress.lab_results[lab.slug].status = "in_progress"
-
-                self.persistence.save_state(self.current_state)
-            else:
-                log.write_info("No se detectaron cambios en los archivos")
-
+            workspace.open_editor()
         except Exception as e:
-            log.write_error(f"Error abriendo editor: {e}")
-            log.write_info("Verifica que tengas nvim/vim instalado o configura EDITOR")
-        finally:
-            self.set_loading(False)
-            # Refrescar pantalla
-            self.refresh()
+            self.print_error(f"Error abriendo editor: {e}")
 
-    async def cmd_submit(self, args: list[str]) -> None:
-        """Evaluar lab."""
-        log = self.get_output_log()
-
-        if not self.current_course or not self.current_state:
-            log.write_error("No hay curso activo")
+    async def cmd_submit(self, args) -> None:
+        """Ejecutar corrección automática del lab actual."""
+        if not self.current_course or not self.current_unit:
+            self.print_error("No hay unidad seleccionada. Usa '/unit <n>' primero.")
             return
 
-        unit = self.current_course.get_current_unit(self.current_state)
-        if not unit:
-            log.write_error("No hay unidad activa")
+        if not self.current_state or not self.current_state.current_lab:
+            self.print_error("No hay lab seleccionado. Usa '/lab' primero.")
             return
 
-        if not self.current_state.current_lab:
-            log.write_error("No hay lab seleccionado. Usa 'lab <slug>' primero.")
-            return
+        unit_path = self._get_unit_path(self.current_unit)
+        lab_slug = self.current_state.current_lab
+        lab_path = self._ensure_lab_structure(unit_path, lab_slug, f"Lab {lab_slug}")
 
-        # Encontrar lab
-        lab = None
-        for l in unit.labs:
-            if l.slug == self.current_state.current_lab:
-                lab = l
-                break
+        from ..core.course import Lab
+        from ..labs.evaluator import PythonEvaluator
+        from ..core.state import LabResult
 
-        if not lab:
-            log.write_error(f"Lab no encontrado: {self.current_state.current_lab}")
-            return
+        lab = Lab(slug=lab_slug, title=f"Lab {lab_slug}", description="")
+        lab.path = lab_path
+        lab.readme_path = lab_path / "README.md"
+        lab.starter_path = lab_path / "starter"
+        lab.submission_path = lab_path / "submission"
+        lab.tests_path = lab_path / "tests"
+        lab.grade_path = lab_path / "grade.json"
 
-        log.write_info(f"Evaluando lab: {lab.title}")
-        log.write_info("Ejecutando tests... (esto puede tomar unos segundos)")
+        evaluator = PythonEvaluator(lab)
+        result = evaluator.evaluate()
 
-        self.set_loading(True)
-
-        try:
-            from ..labs.evaluator import get_evaluator
-
-            evaluator = get_evaluator(lab)
-            result = evaluator.evaluate()
-
-            # Actualizar estado
-            from ..core.state import LabResult
-            progress = self.current_state.get_or_create_unit_progress(unit.number)
-
-            lab_result = LabResult(
-                lab_slug=lab.slug,
-                status="passed" if result.passed else "failed",
-                score=result.score,
-                max_score=result.max_score,
-                passed_tests=result.passed_tests,
-                total_tests=result.total_tests,
-                errors=result.errors,
-                suggestions=result.suggestions,
-            )
-            progress.lab_results[lab.slug] = lab_result
-            self.persistence.save_state(self.current_state)
-
-            # Mostrar resultados
-            log.write(f"\n[bold cyan]{'='*50}[/bold cyan]")
-            log.write(f"[bold]Resultados de evaluación[/bold]")
-            log.write(f"[bold cyan]{'='*50}[/bold cyan]\n")
-
-            score_color = "green" if result.passed else "red"
-            log.write(f"Puntuación: [{score_color}]{result.score:.1f}%[/{score_color}] / {result.max_score:.1f}%")
-            log.write(f"Tests: {result.passed_tests}/{result.total_tests} pasados")
-            log.write(f"Estado: [{score_color}]{'APROBADO' if result.passed else 'NO APROBADO'}[/{score_color}]")
-            log.write(f"Tiempo: {result.execution_time:.2f}s")
-
-            if result.errors:
-                log.write("\n[red bold]Errores encontrados:[/red bold]")
-                for i, error in enumerate(result.errors[:5], 1):
-                    log.write(f"  {i}. {error[:100]}")
-                if len(result.errors) > 5:
-                    log.write(f"  ... y {len(result.errors) - 5} más")
-
-            if result.warnings:
-                log.write("\n[yellow bold]Advertencias:[/yellow bold]")
-                for warning in result.warnings[:3]:
-                    log.write(f"  ⚠ {warning}")
-
-            if result.suggestions:
-                log.write("\n[cyan bold]Sugerencias de mejora:[/cyan bold]")
-                for suggestion in result.suggestions[:3]:
-                    log.write(f"  💡 {suggestion}")
-
-            # Detalle de rubrica
-            if result.rubric:
-                log.write("\n[dim]Desglose de puntuación:[/dim]")
-                for key, value in result.rubric.items():
-                    log.write(f"  {key}: {value:.1f}")
-
-            log.write(f"\n[bold]{'='*50}[/bold]")
-
-            if result.passed:
-                log.write_success("¡Felicitaciones! Has completado este lab.")
-                log.write_info("Escribe 'lab' para ver otros labs o 'unit <n>' para continuar")
-            else:
-                log.write_info("\nNo te desanimes. Revisa los errores y usa 'edit' para corregir.")
-                log.write_info("Escribe 'ask <pregunta>' si necesitas ayuda del tutor")
-
-        except Exception as e:
-            log.write_error(f"Error evaluando: {e}")
-            import traceback
-            log.write(f"[dim]{traceback.format_exc()[:200]}[/dim]")
-        finally:
-            self.set_loading(False)
-
-    async def cmd_progress(self, args: list[str]) -> None:
-        """Ver progreso."""
-        log = self.get_output_log()
-
-        if not self.current_course or not self.current_state:
-            log.write_error("No hay curso activo")
-            return
-
-        total_units = len(self.current_course.units)
-        completed = sum(
-            1 for p in self.current_state.unit_progress.values()
-            if p.status == "completed"
-        )
-        in_progress = sum(
-            1 for p in self.current_state.unit_progress.values()
-            if p.status not in ("not_started", "completed")
+        lab_result = LabResult(
+            lab_slug=lab_slug,
+            status="passed" if result.passed else "failed",
+            score=result.score,
+            max_score=result.max_score,
+            passed_tests=result.passed_tests,
+            total_tests=result.total_tests,
+            errors=result.errors,
+            suggestions=result.suggestions,
         )
 
-        log.write(f"\n[bold cyan]Progreso de: {self.current_course.metadata.title}[/bold cyan]\n")
-        log.write(f"  Unidades completadas: [green]{completed}/{total_units}[/green]")
-        log.write(f"  En progreso: [yellow]{in_progress}[/yellow]")
-        log.write(f"  Unidad actual: {self.current_state.current_unit}")
+        progress = self._get_unit_progress(self.current_unit.number)
+        if progress:
+            progress.lab_results[lab_slug] = lab_result
 
-        # Detalle por unidad
-        log.write("\n[bold]Detalle por unidad:[/bold]")
-        for unit in self.current_course.units:
-            progress = self.current_state.unit_progress.get(unit.number)
-            if progress:
-                status_color = {
-                    "not_started": "dim",
-                    "reading": "yellow",
-                    "practicing": "blue",
-                    "completed": "green",
-                }.get(progress.status, "white")
-                log.write(f"  [{status_color}]●[/{status_color}] {unit.number}. {unit.title} ({progress.status})")
-            else:
-                log.write(f"  [dim]○ {unit.number}. {unit.title} (not_started)[/dim]")
+        self.persistence.save_state(self.current_state)
 
-    async def cmd_export(self, args: list[str]) -> None:
-        """Exportar curso."""
-        log = self.get_output_log()
+        status = "✅ Aprobado" if result.passed else "❌ Reprobado"
+        self.print_info(status)
+        self.print_info(f"Score: {result.score:.1f}/{result.max_score:.1f}")
+        if result.errors:
+            self.print_error("Errores:")
+            for err in result.errors[:5]:
+                print(f"  - {err}")
+        if result.suggestions:
+            self.print_info("Sugerencias:")
+            for sug in result.suggestions[:5]:
+                print(f"  - {sug}")
 
-        if not self.current_course:
-            log.write_error("No hay curso activo para exportar. Usa 'resume' primero.")
+    async def cmd_export(self, args) -> None:
+        """Exportar curso a ZIP."""
+        if not self.current_course and not args:
+            self.print_error("No hay curso cargado. Usa '/resume' para cargar uno.")
             return
 
         from ..export_import.manager import ExportImportManager
 
-        manager = ExportImportManager(self.config.courses_dir)
+        slug = args[0] if args else self.current_course.slug
+        manager = ExportImportManager(self.persistence.courses_dir)
 
         try:
-            log.write_info(f"Exportando curso: {self.current_course.metadata.title}")
-            export_path = manager.export_course(
-                self.current_course.slug,
-                include_history=False,
-            )
-
-            log.write_success(f"Curso exportado exitosamente")
-            log.write_info(f"Archivo: {export_path}")
-
-            # Mostrar info del manifest
-            file_size = export_path.stat().st_size
-            log.write_info(f"Tamaño: {file_size / 1024:.1f} KB")
-
+            output_path = manager.export_course(slug)
+            self.print_success(f"Curso exportado: {output_path}")
         except Exception as e:
-            log.write_error(f"Error exportando: {e}")
+            self.print_error(f"Error exportando curso: {e}")
 
-    async def cmd_import(self, args: list[str]) -> None:
-        """Importar curso."""
-        log = self.get_output_log()
-
+    async def cmd_import(self, args) -> None:
+        """Importar curso desde ZIP."""
         if not args:
-            # Listar exports disponibles
-            from ..export_import.manager import ExportImportManager
-            manager = ExportImportManager(self.config.courses_dir)
-            exports = manager.list_exports()
-
-            if exports:
-                log.write("[bold]Exports disponibles:[/bold]\n")
-                for i, export in enumerate(exports[:10], 1):
-                    size_kb = export["size"] / 1024
-                    log.write(f"  {i}. {export['filename']} ({size_kb:.1f} KB)")
-                log.write_info("\nEscribe 'import <número>' o 'import <ruta>'")
-            else:
-                log.write_info("No hay archivos de export en el directorio de exports")
-                log.write_info("Escribe 'import <ruta_al_zip>' para importar")
+            self.print_error("Especifica la ruta del ZIP. Ejemplo: /import C:\\ruta\\curso.zip")
             return
 
-        # Importar desde ruta
-        from ..export_import.manager import ExportImportManager, ExportImportError
+        from ..export_import.manager import ExportImportManager
 
-        manager = ExportImportManager(self.config.courses_dir)
+        zip_path = Path(args[0])
+        manager = ExportImportManager(self.persistence.courses_dir)
 
-        # Puede ser número de la lista o ruta
-        import_path = args[0]
         try:
-            idx = int(import_path) - 1
-            exports = manager.list_exports()
-            if 0 <= idx < len(exports):
-                import_path = exports[idx]["path"]
-            else:
-                log.write_error("Número de export inválido")
-                return
-        except ValueError:
-            pass  # Es una ruta
+            slug = manager.import_course(zip_path, force=False)
+            self.print_success(f"Curso importado: {slug}")
+            await self.load_course(slug)
+        except Exception as e:
+            self.print_error(f"Error importando curso: {e}")
 
-        import_path = Path(import_path)
-
-        if not import_path.exists():
-            log.write_error(f"Archivo no encontrado: {import_path}")
-            return
-
-        # Validar primero
-        log.write_info("Validando archivo...")
-        validation = manager.validate_export(import_path)
-
-        if not validation["valid"]:
-            log.write_error("El archivo no es válido:")
-            for error in validation["errors"]:
-                log.write(f"  ✗ {error}")
-            return
-
-        if validation["warnings"]:
-            log.write_warning("Advertencias:")
-            for warning in validation["warnings"]:
-                log.write(f"  ⚠ {warning}")
-
-        # Mostrar info del curso a importar
-        manifest = validation.get("manifest", {})
-        log.write(f"\n[bold]Curso a importar:[/bold]")
-        log.write(f"  Título: {manifest.get('course_title', 'Desconocido')}")
-        log.write(f"  Slug: {manifest.get('course_slug', 'Desconocido')}")
-        log.write(f"  Fecha export: {manifest.get('export_date', 'Desconocido')}")
-
-        # Verificar si existe
-        slug = manifest.get("course_slug")
-        if slug and self.persistence.course_exists(slug):
-            log.write_warning(f"\nEl curso '{slug}' ya existe.")
-            log.write_info("Escribe 'import_confirm' para sobrescribir o cualquier otro comando para cancelar")
-            self.pending_action = "import_confirm"
-            self.pending_data = {"path": str(import_path)}
-            return
-
-        # Importar directamente
-        try:
-            imported_slug = manager.import_course(import_path)
-            log.write_success(f"\nCurso importado: {imported_slug}")
-            log.write_info("Escribe 'resume' para cargarlo")
-        except ExportImportError as e:
-            log.write_error(f"Error importando: {e}")
-
-    async def cmd_delete(self, args: list[str]) -> None:
+    async def cmd_delete(self, args) -> None:
         """Eliminar curso."""
-        log = self.get_output_log()
-
-        if not args:
-            log.write_error("Especifica el slug del curso a eliminar: delete <slug>")
+        if not args and not self.current_course:
+            self.print_error("Especifica un slug o carga un curso primero.")
             return
 
-        slug = args[0]
-        if not self.persistence.course_exists(slug):
-            log.write_error(f"Curso no encontrado: {slug}")
+        slug = args[0] if args else self.current_course.slug
+        confirm = self.get_input(f"¿Eliminar curso '{slug}'? (y/n): ").lower().strip()
+        if confirm not in ["y", "yes", "s", "si"]:
+            self.print_info("Eliminación cancelada.")
             return
-
-        log.write(f"[red]¿Eliminar curso '{slug}'? Esto no se puede deshacer.[/red]")
-        log.write_info("Escribe 'delete_confirm' para confirmar o cualquier otro comando para cancelar")
-        self.pending_action = "delete_confirm"
-        self.pending_data = {"slug": slug}
-
-    # ========== Helpers ==========
-
-    async def load_course(self, slug: str) -> None:
-        """Cargar curso y su estado."""
-        log = self.get_output_log()
 
         try:
-            from ..core.course import Course
-            self.current_course = Course.load(self.persistence.get_course_path(slug))
-            self.current_state = self.persistence.load_state(slug)
-
-            if self.current_state is None:
-                self.current_state = self.persistence.create_initial_state(slug)
-
-            self.update_status()
-            log.write_success(f"Curso cargado: {self.current_course.metadata.title}")
-            log.write_info(f"Unidad actual: {self.current_state.current_unit}")
-            log.write_info("Escribe 'read' para ver el material o 'unit <n>' para cambiar")
-
-        except FileNotFoundError:
-            log.write_error(f"Curso no encontrado: {slug}")
+            self.persistence.delete_course(slug)
+            self.print_success(f"Curso '{slug}' eliminado.")
+            if self.current_course and self.current_course.slug == slug:
+                self.current_course = None
+                self.current_state = None
+                self.current_unit = None
         except Exception as e:
-            log.write_error(f"Error al cargar curso: {e}")
+            self.print_error(f"Error eliminando curso: {e}")
 
-    async def handle_pending(self, text: str) -> bool:
-        """Manejar respuestas pendientes de wizards."""
-        if not self.pending_action:
-            return False
 
-        log = self.get_output_log()
-        action = self.pending_action
-        data = self.pending_data or {}
+    async def process_command(self, command: str) -> None:
+        """Procesar comando del usuario."""
+        # Si no empieza con /, tratar como pregunta al tutor
+        if not command.startswith('/'):
+            await self.cmd_ask([command])
+            return
 
-        if action == "delete_confirm":
-            if text.lower() == "delete_confirm":
-                slug = data.get("slug")
-                if slug:
-                    self.persistence.delete_course(slug)
-                    if self.current_course and self.current_course.slug == slug:
-                        self.current_course = None
-                        self.current_state = None
-                        self.update_status()
-                    log.write_success(f"Curso eliminado: {slug}")
-            else:
-                log.write_info("Eliminación cancelada")
+        # Remover el / y procesar como comando
+        command = command[1:]
+        parts = command.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
 
-            self.pending_action = None
-            self.pending_data = None
-            return True
+        # Comandos disponibles
+        handlers = {
+            "help": self.cmd_help,
+            "new": self.cmd_new,
+            "resume": self.cmd_resume,
+            "list": self.cmd_list,
+            "quit": self.cmd_quit,
+            "exit": self.cmd_quit,
+            "q": self.cmd_quit,
+            "unit": self.cmd_unit,
+            "read": self.cmd_read,
+            "ask": self.cmd_ask,
+            "quiz": self.cmd_quiz,
+            "lab": self.cmd_lab,
+            "edit": self.cmd_edit,
+            "submit": self.cmd_submit,
+            "progress": self.cmd_progress,
+            "export": self.cmd_export,
+            "import": self.cmd_import,
+            "delete": self.cmd_delete,
+            "model": self.cmd_model,
+        }
 
-        if action == "new_course_topic":
-            # Guardar tema y pasar a nivel
-            topic = text.strip()
-            if not topic:
-                log.write_error("El tema no puede estar vacío")
-                return True
-
-            self.pending_action = "new_course_level"
-            self.pending_data = {"topic": topic}
-            log.write_tutor(f"Tema seleccionado: {topic}")
-            log.write_info("¿Qué nivel deseas? (beginner/intermediate/advanced)")
-            return True
-
-        if action == "new_course_level":
-            level = text.strip().lower()
-            valid_levels = ["beginner", "intermediate", "advanced"]
-            if level not in valid_levels:
-                log.write_error(f"Nivel inválido. Opciones: {', '.join(valid_levels)}")
-                return True
-
-            self.pending_action = "new_course_duration"
-            self.pending_data["level"] = level
-            log.write_tutor(f"Nivel: {level}")
-            log.write_info("¿Cuánto tiempo tienes disponible? (ej: 2 semanas, 1 mes)")
-            return True
-
-        if action == "new_course_duration":
-            duration = text.strip()
-            if not duration:
-                duration = "4 semanas"
-
-            self.pending_action = "new_course_focus"
-            self.pending_data["duration"] = duration
-            log.write_tutor(f"Duración: {duration}")
-            log.write_info("¿Prefieres enfoque en teoría, práctica, o equilibrado?")
-            return True
-
-        if action == "new_course_focus":
-            focus_map = {
-                "teoria": "theory",
-                "practica": "practice",
-                "equilibrado": "balanced",
-                "theory": "theory",
-                "practice": "practice",
-                "balanced": "balanced",
-                "t": "theory",
-                "p": "practice",
-                "e": "balanced",
-            }
-            focus_input = text.strip().lower()
-            focus = focus_map.get(focus_input, "balanced")
-
-            self.pending_data["focus"] = focus
-            topic = self.pending_data["topic"]
-            level = self.pending_data["level"]
-            duration = self.pending_data["duration"]
-
-            log.write_tutor("Perfecto. Generando curso con Ollama...")
-            log.write_info(f"Tema: {topic}, Nivel: {level}, Duración: {duration}, Enfoque: {focus}")
-            log.write_info("Esto puede tomar unos minutos...")
-
-            # Generar curso completo
-            self.set_loading(True)
-            try:
-                course = await self.content_generator.generate_full_course(
-                    topic=topic,
-                    level=level,
-                    duration=duration,
-                    focus=focus,
-                    persistence=self.persistence,
-                )
-
-                self.current_course = course
-                self.current_state = self.persistence.load_state(course.slug)
-
-                self.update_status()
-                log.write_success(f"\n✓ Curso generado: {course.metadata.title}")
-                log.write_info(f"  - {len(course.units)} unidades")
-                total_labs = sum(len(u.labs) for u in course.units)
-                log.write_info(f"  - {total_labs} laboratorios")
-                log.write_info(f"  - Duración estimada: {course.metadata.estimated_total_time} minutos")
-                log.write_info("\nEscribe 'read' para comenzar con la unidad 1")
-
-            except ContentGenerationError as e:
-                log.write_error(f"Error generando curso: {e}")
-                log.write_info("Intenta de nuevo con un tema más específico o verifica Ollama")
-            except Exception as e:
-                log.write_error(f"Error inesperado: {e}")
-            finally:
-                self.set_loading(False)
-
-            self.pending_action = None
-            self.pending_data = None
-            return True
-
-        if action == "import_confirm":
-            if text.lower() == "import_confirm":
-                from ..export_import.manager import ExportImportManager, ExportImportError
-
-                zip_path = Path(data.get("path", ""))
-                if zip_path.exists():
-                    try:
-                        manager = ExportImportManager(self.config.courses_dir)
-                        imported_slug = manager.import_course(zip_path, force=True)
-                        log.write_success(f"Curso importado: {imported_slug}")
-                        log.write_info("Escribe 'resume' para cargarlo")
-                    except ExportImportError as e:
-                        log.write_error(f"Error importando: {e}")
-                else:
-                    log.write_error("Archivo no encontrado")
-            else:
-                log.write_info("Importación cancelada")
-
-            self.pending_action = None
-            self.pending_data = None
-            return True
-
-        if action == "quiz_answer":
-            answer = text.strip().lower()
-
-            if answer == "quiz_stop":
-                log.write_info("Quiz cancelado")
-                self.pending_action = None
-                self.pending_data = None
-                return True
-
-            q_data = data.get("question", {})
-            q_idx = data.get("question_idx", 0)
-            score = data.get("score", 0)
-            questions = data.get("questions", [])
-            progress = data.get("progress")
-
-            q_type = q_data.get("type", "multiple_choice")
-            options = q_data.get("options", [])
-            correct_answer = q_data.get("correct_answer", "")
-            explanation = q_data.get("explanation", "")
-
-            # Verificar respuesta
-            is_correct = False
-            user_answer = answer
-
-            if answer == "hint":
-                hint = q_data.get("hint", "No hay pista disponible")
-                log.write_info(f"Pista: {hint}")
-                return True  # Mantener en modo quiz
-
-            if q_type == "multiple_choice":
-                # Convertir a/b/c a índice
-                if len(answer) == 1 and answer[0] in "abcdefghijklmnopqrstuvwxyz":
-                    opt_idx = ord(answer[0]) - ord('a')
-                    if 0 <= opt_idx < len(options):
-                        user_answer = options[opt_idx].get("text", answer)
-                        is_correct = options[opt_idx].get("correct", False)
-                else:
-                    # Intentar match por texto
-                    for opt in options:
-                        if answer in opt.get("text", "").lower():
-                            is_correct = opt.get("correct", False)
-                            break
-            else:
-                # Open o code: match directo o parcial
-                is_correct = answer.lower() == correct_answer.lower()
-
-            # Mostrar resultado
-            if is_correct:
-                log.write_success("¡Correcto!")
-                score += 1
-            else:
-                log.write_error(f"Incorrecto. La respuesta era: {correct_answer}")
-
-            if explanation:
-                log.write_info(f"Explicación: {explanation}")
-
-            # Guardar resultado
-            from ..core.state import QuizResult
-            quiz_result = QuizResult(
-                question_id=q_data.get("id", f"q{q_idx}"),
-                correct=is_correct,
-                answer=user_answer,
-                score=1.0 if is_correct else 0.0,
-            )
-            if progress:
-                progress.quiz_results.append(quiz_result)
-                self.persistence.save_state(self.current_state)
-
-            # Avanzar a siguiente pregunta o terminar
-            next_q = q_idx + 1
-            if next_q >= len(questions):
-                # Terminar quiz
-                final_score = (score / len(questions) * 100) if questions else 0
-                log.write(f"\n[bold cyan]Quiz completado[/bold cyan]")
-                log.write(f"Puntuación: {final_score:.0f}% ({score}/{len(questions)})")
-
-                if final_score >= 70:
-                    log.write_success("¡Buen trabajo!")
-                else:
-                    log.write_info("Sigue practicando con 'read'")
-
-                self.pending_action = None
-                self.pending_data = None
-            else:
-                # Preparar siguiente pregunta
-                self.pending_action = "quiz_answer"
-                self.pending_data = {
-                    "question_idx": next_q,
-                    "question": questions[next_q],
-                    "score": score,
-                    "questions": questions,
-                    "progress": progress,
-                }
-                # Mostrar siguiente pregunta inmediatamente
-                self._show_quiz_question(questions[next_q], next_q, len(questions))
-
-            return True
-
-        return False
-
-    def _show_quiz_question(self, q: dict, idx: int, total: int) -> None:
-        """Mostrar una pregunta de quiz."""
-        log = self.get_output_log()
-        q_text = q.get("question", "Pregunta sin texto")
-        options = q.get("options", [])
-
-        log.write(f"\n[bold]Pregunta {idx + 1}/{total}:[/bold]")
-        log.write(f"{q_text}\n")
-
-        if options:
-            for i, opt in enumerate(options):
-                opt_text = opt.get("text", f"Opción {i+1}")
-                log.write(f"  {chr(97+i)}) {opt_text}")
-
-        log.write_info("\nEscribe tu respuesta (a, b, c...) o 'hint' para pista")
-
-    def set_loading(self, loading: bool) -> None:
-        """Mostrar/ocultar indicador de carga."""
-        input_widget = self.query_one(CommandInput)
-        if loading:
-            input_widget.disabled = True
-            input_widget.placeholder = "Generando contenido... espera por favor"
+        handler = handlers.get(cmd)
+        if handler:
+            await handler(args)
         else:
-            input_widget.disabled = False
-            input_widget.placeholder = "Escribe un comando (help para ayuda)"
+            self.print_error(f"Comando desconocido: {cmd}")
+            self.print_info("Escribe '/help' para ver los comandos disponibles")
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Procesar input con soporte para wizards."""
-        input_widget = self.query_one(CommandInput)
-        text = event.value.strip()
-
-        if not text:
+    async def cmd_ask(self, args) -> None:
+        """Preguntar al tutor sobre el material actual."""
+        question = " ".join(args) if args else ""
+        
+        if not question:
+            self.print_error("¿Qué quieres preguntarle al tutor?")
             return
 
-        # Verificar si hay acción pendiente
-        if await self.handle_pending(text):
-            input_widget.value = ""
+        if not self.current_course or not self.current_unit:
+            self.print_error("No hay unidad seleccionada. Usa '/unit <n>' para seleccionar una.")
             return
 
-        # Procesar como comando normal
-        await super().on_input_submitted(event)
+        # Obtener contexto del material actual
+        context = ""
+        if self.current_unit.material_path and self.current_unit.material_path.exists():
+            try:
+                with open(self.current_unit.material_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    # Tomar los primeros 2000 caracteres como contexto
+                    context = content[:2000] + "..." if len(content) > 2000 else content
+            except Exception:
+                context = "No se pudo cargar el contexto del material."
+
+        # Preparar el prompt para el tutor
+        system_prompt = f"""Eres un tutor experto en {self.current_course.metadata.title}.
+Estás enseñando la unidad "{self.current_unit.title}" a un estudiante de nivel {self.current_course.metadata.level}.
+
+Contexto del material actual:
+{context}
+
+Responde de manera pedagógica, clara y concisa. Si la pregunta no está relacionada con el material actual, redirígela al tema correspondiente.
+Adapta tu respuesta al nivel del estudiante."""
+
+        user_prompt = f"Pregunta del estudiante: {question}"
+
+        try:
+            self.print_tutor("Pensando...")
+            
+            # Verificar si Ollama está disponible y el modelo existe
+            ollama_status = await self.content_generator.check_ollama()
+            if not ollama_status.get("ok", False):
+                self.print_tutor("Lo siento, no tengo acceso a IA en este momento. Te recomiendo revisar el material de la unidad actual con '/read' o cambiar a otra unidad con '/unit <n>'.")
+                return
+
+            # Verificar si el modelo está disponible
+            available_models = ollama_status.get("data", {}).get("models", [])
+            model_names = [m.get("name", "") for m in available_models]
+            if self.ollama_model not in model_names:
+                self.print_tutor(f"Lo siento, el modelo '{self.ollama_model}' no está disponible. Modelos disponibles: {', '.join(model_names[:3])}. Te recomiendo revisar el material con '/read'.")
+                return
+
+            # Crear cliente LLM
+            from ..llm.client import OllamaClient, Message
+            client = OllamaClient(model=self.ollama_model)
+            
+            response = await client.chat(
+                messages=[
+                    Message(role="system", content=system_prompt),
+                    Message(role="user", content=user_prompt)
+                ]
+            )
+            
+            self.print_tutor(response.content)
+            
+        except Exception as e:
+            self.print_error(f"Error consultando al tutor: {e}")
+            self.print_info("Asegúrate de que Ollama esté ejecutándose en localhost:11434")
+
+    async def cmd_model(self, args) -> None:
+        """Seleccionar modelo de Ollama."""
+        self.print_info("🔍 Verificando modelos disponibles en Ollama...")
+        
+        try:
+            # Verificar conexión con Ollama
+            status = await self.content_generator.check_ollama()
+            if not status.get("ok", False):
+                self.print_error("No se puede conectar con Ollama. Asegúrate de que esté ejecutándose.")
+                self.print_info("Instala Ollama desde: https://ollama.ai")
+                return
+            
+            models_data = status.get("data", {})
+            available_models = models_data.get("models", [])
+            
+            if not available_models:
+                self.print_error("No hay modelos disponibles en Ollama.")
+                self.print_info("Ejecuta: ollama pull llama2  (o cualquier modelo que quieras)")
+                return
+            
+            # Mostrar modelos disponibles
+            print("\033[32m🤖 Modelos disponibles en Ollama:\033[0m")
+            print()
+            
+            current_model = self.ollama_model
+            
+            for i, model in enumerate(available_models, 1):
+                model_name = model.get("name", "desconocido")
+                size = model.get("size", 0)
+                size_gb = size / (1024**3) if size else 0
+                
+                # Marcar modelo actual
+                marker = " \033[32m← actual\033[0m" if model_name == current_model else ""
+                
+                print(f"  {i}. \033[36m{model_name}\033[0m ({size_gb:.1f} GB){marker}")
+            
+            print()
+            
+            if len(args) >= 1:
+                # Seleccionar modelo por nombre o número
+                selection = args[0]
+                selected_model = None
+                
+                try:
+                    # Intentar como número
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(available_models):
+                        selected_model = available_models[idx].get("name")
+                except ValueError:
+                    # Intentar como nombre
+                    for model in available_models:
+                        if model.get("name") == selection:
+                            selected_model = selection
+                            break
+                
+                if selected_model:
+                    self.ollama_model = selected_model
+                    # Actualizar cliente del generador
+                    try:
+                        self.content_generator.client.model = selected_model
+                    except Exception:
+                        pass
+
+                    self.print_success(f"Modelo seleccionado: {selected_model}")
+                    self.print_info("Este cambio aplica a la sesión actual")
+                else:
+                    self.print_error(f"Modelo '{selection}' no encontrado")
+            else:
+                self.print_info("Usa '/model <número>' o '/model <nombre>' para seleccionar un modelo")
+                self.print_info("Ejemplos: '/model 1' o '/model llama2'")
+                
+        except Exception as e:
+            self.print_error(f"Error consultando modelos: {e}")
+
+
+async def main():
+    """Función principal."""
+    tutor = TutorApp()
+    await tutor.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
