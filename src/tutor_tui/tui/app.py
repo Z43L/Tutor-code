@@ -47,7 +47,7 @@ class TutorApp:
         """Imprimir encabezado."""
         print("\033[33m" + "="*50 + "\033[0m")
         print("\033[33m" + "           ¡BullCode Tutor!" + "\033[0m")
-        print("\033[33m" + "    Tu tutor de programación con IA local" + "\033[0m")
+        print("\033[33m" + "    aprende a programar , Trabaja!!!" + "\033[0m")
         print("\033[33m" + "="*50 + "\033[0m")
         print()
 
@@ -1815,7 +1815,7 @@ Adapta tu respuesta al nivel del estudiante."""
 
         self.persistence.save_state(self.current_state)
 
-        status = "✅ Aprobado" if result.passed else "❌ Reprobado"
+        status = "✅ Aprobado" if result.passed else "❌ suspendido pa tu casa"
         self.print_info(status)
         self.print_info(f"Score: {result.score:.1f}/{result.max_score:.1f}")
         if result.errors:
