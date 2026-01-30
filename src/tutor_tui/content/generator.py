@@ -102,7 +102,7 @@ class ContentGenerator:
                 prompt=prompt,
                 system=UNIT_MATERIAL_SYSTEM,
                 temperature=0.7,
-                max_tokens=12000,
+                max_tokens=20000,
             )
 
             return response.content

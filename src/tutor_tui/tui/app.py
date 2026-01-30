@@ -51,6 +51,388 @@ class TutorApp:
         print("\033[33m" + "="*50 + "\033[0m")
         print()
 
+    def render_shell(self, last_input: str | None = None) -> None:
+        """Limpiar pantalla y mostrar branding antes de cada interacción."""
+        print("\033c", end="")  # ANSI clear screen
+        self.print_logo()
+        self.print_header()
+        if last_input:
+            self.print_user(last_input)
+            print()
+
+    def _detect_language_for_unit(self, unit_title: str | None = None) -> str:
+        """Inferir lenguaje preferido a partir del stack o título de la unidad."""
+        hints = [s.lower() for s in (self.current_course.metadata.stack if self.current_course and self.current_course.metadata.stack else [])]
+        title = (unit_title or (self.current_unit.title if self.current_unit else "")).lower()
+        if any("python" in s for s in hints) or "python" in title:
+            return "python"
+        if any(s in ("js", "javascript") or "javascript" in s for s in hints) or "javascript" in title:
+            return "javascript"
+        if any("typescript" in s or "ts" == s for s in hints) or "typescript" in title:
+            return "typescript"
+        if any("go" == s or s.startswith("golang") for s in hints) or "golang" in title:
+            return "go"
+        if any("java" == s for s in hints) or "java" in title:
+            return "java"
+        return "python"
+
+    def _detect_language_from_stack(self, stack: str | None) -> str:
+        """Elegir lenguaje base a partir de una cadena de stack."""
+        if not stack:
+            return "python"
+        value = stack.lower()
+        if "javascript" in value or value in ("js", "node"):
+            return "javascript"
+        if "typescript" in value or value == "ts":
+            return "typescript"
+        if "java" == value:
+            return "java"
+        if value in ("go", "golang"):
+            return "go"
+        return "python"
+
+    def _normalize_lab_slug(self, raw: str, existing: list[str]) -> str:
+        """Normalizar slug de lab (lab01, lab02...)."""
+        cleaned = raw.strip()
+        if cleaned in existing:
+            return cleaned
+        slug = cleaned.lower().replace(" ", "")
+        if slug.isdigit():
+            slug = f"lab{int(slug):02d}"
+        elif slug.startswith("lab") and slug[3:].isdigit():
+            slug = f"lab{int(slug[3:]):02d}"
+        elif not slug.startswith("lab"):
+            slug = f"lab{slug}"
+
+        # Evitar colisiones simples
+        counter = 1
+        base = slug
+        while slug in existing:
+            slug = f"{base}-{counter}"
+            counter += 1
+        return slug
+
+    def _next_lab_slug(self, existing: list[str]) -> str:
+        """Obtener siguiente slug secuencial."""
+        numbers = []
+        for slug in existing:
+            tail = "".join(ch for ch in slug if ch.isdigit())
+            if tail.isdigit():
+                numbers.append(int(tail))
+        next_n = max(numbers) + 1 if numbers else 1
+        return f"lab{next_n:02d}"
+
+    def _list_unit_labs(self, unit_path: Path) -> list[str]:
+        """Listar labs disponibles en disco para la unidad."""
+        labs_dir = unit_path / "labs"
+        if not labs_dir.exists():
+            return []
+        return sorted([p.name for p in labs_dir.iterdir() if p.is_dir()])
+
+    def _load_lab_meta(self, lab_path: Path) -> dict:
+        """Leer metadata del lab si existe."""
+        meta_file = lab_path / "lab.json"
+        if meta_file.exists():
+            try:
+                return json.loads(meta_file.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    def _save_lab_meta(self, lab_path: Path, data: dict) -> None:
+        """Guardar metadata del lab."""
+        meta_file = lab_path / "lab.json"
+        try:
+            meta_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _infer_lab_language(self, lab_path: Path, fallback: str) -> str:
+        """Inferir lenguaje de un lab desde metadata o archivos."""
+        meta = self._load_lab_meta(lab_path)
+        if meta.get("language"):
+            return meta["language"]
+        tests = lab_path / "tests"
+        if tests.exists():
+            if any(tests.rglob("*.js")):
+                return "javascript"
+            if any(tests.rglob("*.py")):
+                return "python"
+        return fallback
+
+    def _infer_lab_type(self, lab_path: Path, fallback: str = "full") -> str:
+        """Inferir tipo de lab."""
+        meta = self._load_lab_meta(lab_path)
+        return meta.get("lab_type", fallback)
+
+    async def _generate_lab_with_ai(self, lab_path: Path, lab_title: str, language: str, lab_type: str) -> bool:
+        """Intentar generar un lab con Ollama usando contexto de la unidad."""
+        try:
+            status = await self.content_generator.check_ollama()
+            if not status.get("ok", False):
+                return False
+
+            # Checar modelo seleccionado
+            available_models = status.get("data", {}).get("models", [])
+            model_names = [m.get("name", "") for m in available_models]
+            if self.ollama_model and self.ollama_model not in model_names:
+                return False
+
+            # Cargar material de unidad como contexto
+            material_content = ""
+            if self.current_unit.material_path and self.current_unit.material_path.exists():
+                material_content = self.current_unit.material_path.read_text(encoding="utf-8")
+            else:
+                material_content = self._generate_basic_material(self.current_unit)
+
+            # Crear lab temporal
+            submission_dir = lab_path / "submission"
+            starter_dir = lab_path / "starter"
+            tests_dir = lab_path / "tests"
+            submission_dir.mkdir(parents=True, exist_ok=True)
+            starter_dir.mkdir(parents=True, exist_ok=True)
+            tests_dir.mkdir(parents=True, exist_ok=True)
+
+            from ..core.course import Lab
+            lab = Lab(
+                slug=lab_path.name,
+                title=lab_title,
+                description=f"Práctica de {self.current_unit.title}",
+                language=language,
+                lab_type=lab_type,
+            )
+            lab.path = lab_path
+            lab.readme_path = submission_dir / "README.md"
+            lab.starter_path = starter_dir
+            lab.submission_path = submission_dir
+            lab.tests_path = tests_dir
+
+            lab_content = await self.content_generator.generate_lab_content(self.current_unit, lab, material_content)
+
+            # README en submission
+            readme_text = lab_content.get("readme")
+            if readme_text:
+                lab.readme_path.write_text(readme_text, encoding="utf-8")
+
+            starter_files = lab_content.get("starter_files", {}) or {}
+            test_files = lab_content.get("test_files", {}) or {}
+
+            # Escribir starters
+            for filename, content in starter_files.items():
+                target = starter_dir / filename
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+
+            # Escribir tests
+            for filename, content in test_files.items():
+                target = tests_dir / filename
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+
+            # Preparar submission
+            if starter_files:
+                for filename in starter_files.keys():
+                    dest = submission_dir / filename
+                    if lab_type == "full":
+                        dest.write_text(self._placeholder_for_extension(filename), encoding="utf-8")
+                    else:
+                        # bugfix/fill: el mismo archivo que starter (roto o con TODO) lo pone la IA
+                        src = starter_dir / filename
+                        dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+            return True
+        except Exception:
+            return False
+
+    def _placeholder_for_extension(self, filename: str) -> str:
+        """Crear placeholder básico según extensión."""
+        if filename.endswith(".py"):
+            return "# TODO: implementa la solución\n"
+        if filename.endswith(".js") or filename.endswith(".ts"):
+            return "// TODO: implementa la solución\n"
+        if filename.endswith(".cpp") or filename.endswith(".cc") or filename.endswith(".cxx"):
+            return "// TODO: implementa la solución\n"
+        if filename.endswith(".c"):
+            return "/* TODO: implementa la solución */\n"
+        if filename.endswith(".go"):
+            return "package main\n// TODO: implementa la solución\n"
+        if filename.endswith(".java"):
+            return "// TODO: implementa la solución\n"
+        if filename.endswith(".sql"):
+            return "-- TODO: escribe la consulta\n"
+        return "# TODO\n"
+
+    def _scaffold_lab_files(self, lab_path: Path, lab_title: str, language: str, lab_type: str) -> None:
+        """Crear starter, submission y tests según el lenguaje y tipo."""
+        starter_dir = lab_path / "starter"
+        submission_dir = lab_path / "submission"
+        tests_dir = lab_path / "tests"
+        starter_dir.mkdir(parents=True, exist_ok=True)
+        submission_dir.mkdir(parents=True, exist_ok=True)
+        tests_dir.mkdir(parents=True, exist_ok=True)
+
+        # README ahora vive en submission para que el alumno lo tenga a mano
+        readme_path = submission_dir / "README.md"
+        if not readme_path.exists():
+            readme_content = f"""# {lab_title}
+
+## Subject (trabaja en `submission/`)
+- **Lenguaje:** {language}
+- **Tipo:** {lab_type} (full = implementa todo, bugfix = corrige código roto, fill = completa TODOs).
+- **Objetivo:** Implementa `transform_numbers` que devuelva los pares multiplicados por 2 preservando el orden.
+
+## Archivos esperados en `submission/`
+- Código principal (ej: `main.py`, `main.cpp`, `Main.java`, `query.sql`, etc).
+- No edites los tests en `tests/`; son para validar tu solución.
+
+## Cómo evaluar
+1. Trabaja en `submission/`.
+2. Ejecuta `/submit` para correr los tests unitarios generados.
+"""
+            readme_path.write_text(readme_content, encoding="utf-8")
+
+        # Generar scaffolds por lenguaje/tipo
+        def write(path: Path, content: str) -> None:
+            path.write_text(content, encoding="utf-8")
+
+        def write_if_missing(path: Path, content: str) -> None:
+            if not path.exists():
+                path.write_text(content, encoding="utf-8")
+
+        def sync_into_submission(src: Path, dst: Path, placeholder: str | None = None) -> None:
+            """Copiar starter a submission si no existe (o escribir placeholder)."""
+            if dst.exists():
+                return
+            if placeholder is not None:
+                dst.write_text(placeholder, encoding="utf-8")
+            elif src.exists():
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+        # Python
+        if language == "python":
+            starter = '''from typing import Iterable, List\n\n\ndef transform_numbers(values: Iterable[int]) -> List[int]:\n    """Devuelve números pares multiplicados por 2, preservando orden."""\n    return [n * 2 for n in values if isinstance(n, int) and n % 2 == 0]\n\n\nif __name__ == "__main__":\n    print(transform_numbers([1, 2, 3, 4]))\n'''
+            bugged = starter.replace("return [n * 2 for n in values if isinstance(n, int) and n % 2 == 0]", "return []  # BUG: no implementado")
+            fill = '''from typing import Iterable, List\n\n\ndef transform_numbers(values: Iterable[int]) -> List[int]:\n    \"\"\"TODO: implementa la transformación\"\"\"\n    # TODO: devuelve los pares multiplicados por 2, preservando orden\n    return []\n\n\nif __name__ == "__main__":\n    print(transform_numbers([1, 2, 3, 4]))\n'''
+            starter_body = starter if lab_type == "full" else bugged if lab_type == "bugfix" else fill
+            full_stub = '''from typing import Iterable, List\n\n\ndef transform_numbers(values: Iterable[int]) -> List[int]:\n    \"\"\"Implementa la lógica aquí\"\"\"\n    return []\n'''
+            student_body = full_stub if lab_type == "full" else (bugged if lab_type == "bugfix" else fill)
+            main_path = starter_dir / "main.py"
+            write(main_path, starter_body)
+            write_if_missing(submission_dir / "main.py", student_body)
+            write_if_missing(
+                tests_dir / "test_main.py",
+                """from submission.main import transform_numbers\n\n\ndef test_basic():\n    assert transform_numbers([1, 2, 3, 4]) == [4, 8]\n\n\ndef test_empty():\n    assert transform_numbers([]) == []\n\n\ndef test_zero_and_negative():\n    assert transform_numbers([0, -2, 5]) == [0, -4]\n\n\ndef test_no_evens():\n    assert transform_numbers([1, 3, 5]) == []\n""",
+            )
+
+        # JavaScript / TypeScript
+        elif language in ("javascript", "typescript", "js", "ts"):
+            starter = """function transform_numbers(values) {\n  return values\n    .filter((n) => Number.isInteger(n) && n % 2 === 0)\n    .map((n) => n * 2);\n}\n\nmodule.exports = { transform_numbers };\n"""
+            bugged = starter.replace(".filter((n) => Number.isInteger(n) && n % 2 === 0)", ".filter(() => false) // BUG: filtra mal")
+            fill = """function transform_numbers(values) {\n  // TODO: devuelve pares * 2 preservando orden\n  return [];\n}\n\nmodule.exports = { transform_numbers };\n"""
+            starter_body = starter if lab_type == "full" else bugged if lab_type == "bugfix" else fill
+            full_stub = """function transform_numbers(values) {\n  // Implementa aquí\n  return [];\n}\n\nmodule.exports = { transform_numbers };\n"""
+            student_body = full_stub if lab_type == "full" else (bugged if lab_type == "bugfix" else fill)
+            main_path = starter_dir / "main.js"
+            write(main_path, starter_body)
+            write_if_missing(submission_dir / "main.js", student_body)
+            write_if_missing(
+                tests_dir / "test_main.py",
+                """import importlib.util\nimport subprocess\nfrom pathlib import Path\n\n\ndef _run_node():\n    test_js = Path(__file__).parent / "test_runner.js"\n    res = subprocess.run(["node", str(test_js)], capture_output=True, text=True)\n    if res.returncode != 0:\n        raise AssertionError(res.stderr or res.stdout)\n\n\ndef test_node_runner():\n    _run_node()\n""",
+            )
+            write_if_missing(
+                tests_dir / "test_runner.js",
+                """const assert = require('assert');\nconst { transform_numbers } = require('../submission/main');\n\nconst cases = [\n  { input: [1, 2, 3, 4], expected: [4, 8] },\n  { input: [], expected: [] },\n  { input: [0, -2, 5], expected: [0, -4] },\n  { input: [1, 3, 5], expected: [] },\n];\n\ncases.forEach(({ input, expected }, idx) => {\n  const result = transform_numbers(input);\n  assert.deepStrictEqual(result, expected, `Caso ${idx + 1}`);\n});\n\nconsole.log(JSON.stringify({ passed: cases.length, total: cases.length }));\n""",
+            )
+
+        # C
+        elif language in ("c", "c99", "c11"):
+            starter = """#include <stdio.h>\n#include <stdbool.h>\n\nint transform_numbers(const int *input, int len, int *output) {\n    int j = 0;\n    for (int i = 0; i < len; i++) {\n        if (input[i] % 2 == 0) {\n            output[j++] = input[i] * 2;\n        }\n    }\n    return j;\n}\n\nint main() { return 0; }\n"""
+            bugged = starter.replace("output[j++] = input[i] * 2;", "output[j++] = input[i]; // BUG: no multiplica")
+            fill = """#include <stdio.h>\n#include <stdbool.h>\n\nint transform_numbers(const int *input, int len, int *output) {\n    // TODO: llena output con pares*2 preservando orden y devuelve la cantidad escrita\n    return 0;\n}\n\nint main() { return 0; }\n"""
+            starter_body = starter if lab_type == "full" else bugged if lab_type == "bugfix" else fill
+            full_stub = """#include <stdio.h>\n#include <stdbool.h>\n\nint transform_numbers(const int *input, int len, int *output) {\n    // Implementa aquí\n    return 0;\n}\n\nint main() { return 0; }\n"""
+            student_body = full_stub if lab_type == "full" else (bugged if lab_type == "bugfix" else fill)
+            main_path = starter_dir / "main.c"
+            write(main_path, starter_body)
+            write_if_missing(submission_dir / "main.c", student_body)
+            write_if_missing(
+                tests_dir / "test_main.py",
+                """import subprocess\nfrom pathlib import Path\n\n\ndef test_c_build_and_run(tmp_path: Path):\n    src = Path(__file__).parents[1] / "submission" / "main.c"\n    binary = tmp_path / "app"\n    compile_cmd = ["gcc", str(src), "-o", str(binary)]\n    res = subprocess.run(compile_cmd, capture_output=True, text=True)\n    if res.returncode != 0:\n        raise AssertionError(f\"Compilación falló: {res.stderr}\")\n\n    # Ejecutar pruebas simples dentro de C\n    code = r'''\n#include <assert.h>\n#include <stdio.h>\nint transform_numbers(const int *, int, int *);\nint main(){int in[4]={1,2,3,4}; int out[4]={0}; int n=transform_numbers(in,4,out); assert(n==2); assert(out[0]==4); assert(out[1]==8); return 0;}\n'''\n    test_c = tmp_path / "test.c"\n    test_c.write_text(code, encoding=\"utf-8\")\n    res2 = subprocess.run([\"gcc\", str(test_c), str(src), \"-o\", str(tmp_path / \"test\")], capture_output=True, text=True)\n    if res2.returncode != 0:\n        raise AssertionError(f\"Test C falló: {res2.stderr}\")\n    res3 = subprocess.run([str(tmp_path / \"test\")], capture_output=True, text=True)\n    if res3.returncode != 0:\n        raise AssertionError(f\"Test C ejecutado con error: {res3.stderr}\")\n""",
+            )
+
+        # C++
+        elif language in ("cpp", "c++", "cpp17", "cpp20"):
+            starter = """#include <vector>\n\nstd::vector<int> transform_numbers(const std::vector<int>& input) {\n    std::vector<int> out;\n    for (auto n : input) {\n        if (n % 2 == 0) out.push_back(n * 2);\n    }\n    return out;\n}\n"""
+            bugged = starter.replace("out.push_back(n * 2);", "out.push_back(n); // BUG")
+            fill = """#include <vector>\n\nstd::vector<int> transform_numbers(const std::vector<int>& input) {\n    // TODO: devuelve pares*2 preservando orden\n    return {};\n}\n"""
+            starter_body = starter if lab_type == "full" else bugged if lab_type == "bugfix" else fill
+            full_stub = """#include <vector>\n\nstd::vector<int> transform_numbers(const std::vector<int>& input) {\n    // Implementa aquí\n    return {};\n}\n"""
+            student_body = full_stub if lab_type == "full" else (bugged if lab_type == "bugfix" else fill)
+            main_path = starter_dir / "main.cpp"
+            write(main_path, starter_body)
+            write_if_missing(submission_dir / "main.cpp", student_body)
+            write_if_missing(
+                tests_dir / "test_main.py",
+                """import subprocess\nfrom pathlib import Path\n\ndef test_cpp(tmp_path: Path):\n    src = Path(__file__).parents[1] / \"submission\" / \"main.cpp\"\n    binary = tmp_path / \"app\"\n    res = subprocess.run([\"g++\", \"-std=c++17\", str(src), \"-o\", str(binary)], capture_output=True, text=True)\n    if res.returncode != 0:\n        raise AssertionError(f\"Compilación falló: {res.stderr}\")\n\n    code = r'''\n#include <cassert>\n#include <vector>\nstd::vector<int> transform_numbers(const std::vector<int>&);\nint main(){std::vector<int> v{1,2,3,4}; auto out = transform_numbers(v); assert(out.size()==2); assert(out[0]==4); assert(out[1]==8); return 0;}\n'''\n    test_cpp = tmp_path / \"test.cpp\"\n    test_cpp.write_text(code, encoding=\"utf-8\")\n    res2 = subprocess.run([\"g++\", \"-std=c++17\", str(test_cpp), str(src), \"-o\", str(tmp_path / \"test\")], capture_output=True, text=True)\n    if res2.returncode != 0:\n        raise AssertionError(f\"Test falló: {res2.stderr}\")\n    res3 = subprocess.run([str(tmp_path / \"test\")], capture_output=True, text=True)\n    if res3.returncode != 0:\n        raise AssertionError(f\"Ejecución falló: {res3.stderr}\")\n""",
+            )
+
+        # Go
+        elif language == "go":
+            starter = """package main\n\nfunc TransformNumbers(values []int) []int {\n    out := []int{}\n    for _, n := range values {\n        if n%2 == 0 {\n            out = append(out, n*2)\n        }\n    }\n    return out\n}\n"""
+            bugged = starter.replace("out = append(out, n*2)", "out = append(out, n) // BUG")
+            fill = """package main\n\nfunc TransformNumbers(values []int) []int {\n    // TODO: devuelve pares*2 preservando orden\n    return []int{}\n}\n"""
+            starter_body = starter if lab_type == "full" else bugged if lab_type == "bugfix" else fill
+            full_stub = """package main\n\nfunc TransformNumbers(values []int) []int {\n    // Implementa aquí\n    return []int{}\n}\n"""
+            student_body = full_stub if lab_type == "full" else (bugged if lab_type == "bugfix" else fill)
+            main_path = starter_dir / "main.go"
+            write(main_path, starter_body)
+            write_if_missing(submission_dir / "main.go", student_body)
+            write_if_missing(
+                tests_dir / "test_main.py",
+                """import subprocess\nfrom pathlib import Path\n\ndef test_go(tmp_path: Path):\n    src = Path(__file__).parents[1] / \"submission\"\n    res = subprocess.run([\"go\", \"test\", \"./...\"], cwd=src, capture_output=True, text=True)\n    if res.returncode != 0:\n        raise AssertionError(res.stderr or res.stdout)\n""",
+            )
+            write_if_missing(
+                submission_dir / "main_test.go",
+                """package main\n\nimport \"testing\"\n\nfunc TestTransformNumbers(t *testing.T) {\n    res := TransformNumbers([]int{1,2,3,4})\n    if len(res) != 2 || res[0] != 4 || res[1] != 8 {\n        t.Fatalf(\"resultado incorrecto: %v\", res)\n    }\n}\n""",
+            )
+
+        # SQL (SQLite)
+        elif language == "sql":
+            query_path = starter_dir / "query.sql"
+            starter_body = """-- Devuelve los nombres de estudiantes aprobados (score >= 70)\nSELECT name\nFROM students\nWHERE score >= 70\nORDER BY score DESC;\n"""
+            student_body = """-- TODO: escribe la consulta para devolver los nombres aprobados (score >= 70), ordenados desc.\n"""
+            write(query_path, starter_body)
+            write_if_missing(submission_dir / "query.sql", student_body)
+            write_if_missing(
+                tests_dir / "test_main.py",
+                """import sqlite3\nfrom pathlib import Path\n\n\ndef _load_query() -> str:\n    sql_file = Path(__file__).parents[1] / \"submission\" / \"query.sql\"\n    if not sql_file.exists():\n        raise AssertionError(\"query.sql no encontrado\")\n    return sql_file.read_text(encoding=\"utf-8\")\n\n\ndef test_sql_query():\n    query = _load_query()\n    conn = sqlite3.connect(\":memory:\")\n    conn.execute(\"CREATE TABLE students(name TEXT, score INTEGER);\")\n    conn.executemany(\"INSERT INTO students VALUES (?, ?);\", [\n        (\"Alice\", 80), (\"Bob\", 65), (\"Charlie\", 90), (\"Dana\", 70)\n    ])\n    rows = conn.execute(query).fetchall()\n    names = [r[0] for r in rows]\n    assert names == [\"Charlie\", \"Alice\", \"Dana\"], f\"Resultado incorrecto: {names}\"\n""",
+            )
+
+        # Java (simple JUnit via pytest shell)
+        elif language == "java":
+            starter = """public class Main {\n    public static int[] transformNumbers(int[] values) {\n        java.util.List<Integer> out = new java.util.ArrayList<>();\n        for (int n : values) {\n            if (n % 2 == 0) out.add(n * 2);\n        }\n        return out.stream().mapToInt(Integer::intValue).toArray();\n    }\n}\n"""
+            bugged = starter.replace("out.add(n * 2);", "out.add(n); // BUG")
+            fill = starter.replace("out.add(n * 2);", "// TODO: agrega multiplicación\n            out.add(n * 2);")
+            starter_body = starter if lab_type == "full" else bugged if lab_type == "bugfix" else fill
+            student_body = fill if lab_type == "full" else bugged if lab_type == "bugfix" else fill
+            main_path = starter_dir / "Main.java"
+            write(main_path, starter_body)
+            write_if_missing(submission_dir / "Main.java", student_body)
+            write_if_missing(
+                tests_dir / "test_main.py",
+                """import subprocess\nfrom pathlib import Path\n\ndef test_java(tmp_path: Path):\n    submission = Path(__file__).parents[1] / \"submission\"\n    res = subprocess.run([\"javac\", \"Main.java\"], cwd=submission, capture_output=True, text=True)\n    if res.returncode != 0:\n        raise AssertionError(res.stderr)\n    runner = tmp_path / \"Runner.java\"\n    runner.write_text(\n        \"\"\"public class Runner {\\n  public static void main(String[] args) {\\n    int[] in = {1,2,3,4};\\n    int[] out = Main.transformNumbers(in);\\n    if (out.length != 2 || out[0] != 4 || out[1] != 8) throw new RuntimeException(\\\"Incorrecto\\\");\\n  }\\n}\\n\"\"\",\n        encoding=\"utf-8\",\n    )\n    res2 = subprocess.run([\"javac\", str(runner), \"-cp\", str(submission)], capture_output=True, text=True, cwd=tmp_path)\n    if res2.returncode != 0:\n        raise AssertionError(res2.stderr)\n    res3 = subprocess.run([\"java\", \"-cp\", f\"{tmp_path}:{submission}\", \"Runner\"], capture_output=True, text=True)\n    if res3.returncode != 0:\n        raise AssertionError(res3.stderr)\n""",
+            )
+
+        # Fallback (usa Python)
+        else:
+            main_path = starter_dir / "main.py"
+            write(main_path, '''def placeholder(values):\n    """Reemplaza esta función con tu solución."""\n    return values\n''')
+            sync_into_submission(main_path, submission_dir / "main.py")
+            write_if_missing(
+                tests_dir / "test_main.py",
+                """from submission.main import placeholder\n\n\ndef test_placeholder():\n    assert placeholder([1, 2]) == [1, 2]\n""",
+            )
+
     def print_info(self, message: str) -> None:
         """Imprimir mensaje informativo."""
         print(f"\033[38;5;208mℹ {message}\033[0m")
@@ -210,14 +592,14 @@ class TutorApp:
         self.print_tutor(f"Nivel seleccionado: {level}")
         print()
 
-        self.print_tutor("¿Cuántas semanas tienes disponibles? (2-16)")
+        self.print_tutor("¿Cuántas semanas tienes disponibles? (2-100)")
         weeks_input = self.get_input("Semanas: ").strip()
         try:
             weeks = int(weeks_input)
-            if not 2 <= weeks <= 16:
+            if not 2 <= weeks <= 100:
                 raise ValueError()
         except ValueError:
-            self.print_error("Por favor ingresa un número entre 2 y 16")
+            self.print_error("Por favor ingresa un número entre 2 y 100")
             return
 
         self.print_tutor(f"Duración: {weeks} semanas")
@@ -303,9 +685,11 @@ class TutorApp:
                 for lab_data in unit_data.get("labs", []):
                     labs.append(
                         Lab(
-                            slug=lab_data.get("slug", f"lab-{i:02d}"),
+                            slug=lab_data.get("slug", f"lab{i:02d}"),
                             title=lab_data.get("title", f"Lab {i}"),
                             description=lab_data.get("description", ""),
+                            language=lab_data.get("language", self._detect_language_from_stack(stack)),
+                            lab_type=lab_data.get("lab_type", "full"),
                             difficulty=lab_data.get("difficulty", "medium"),
                             estimated_time=lab_data.get("estimated_time", 30),
                             skills=lab_data.get("skills", []),
@@ -347,6 +731,7 @@ class TutorApp:
         """Generar un syllabus básico cuando Ollama no está disponible."""
         # Crear estructura básica del curso
         units = []
+        language_default = self._detect_language_from_stack(stack)
         
         # Definir unidades básicas según el nivel
         if level == "beginner":
@@ -361,6 +746,7 @@ class TutorApp:
                             "slug": "setup-entorno",
                             "title": "Configuración del entorno",
                             "description": "Instalar y configurar las herramientas necesarias",
+                            "language": language_default,
                             "difficulty": "easy",
                             "estimated_time": 30
                         }
@@ -376,6 +762,7 @@ class TutorApp:
                             "slug": "hola-mundo",
                             "title": "Hola Mundo",
                             "description": "Crear tu primera aplicación",
+                            "language": language_default,
                             "difficulty": "easy",
                             "estimated_time": 45
                         }
@@ -394,6 +781,7 @@ class TutorApp:
                             "slug": "proyecto-medio",
                             "title": "Proyecto intermedio",
                             "description": "Aplicar conocimientos en un proyecto real",
+                            "language": language_default,
                             "difficulty": "medium",
                             "estimated_time": 90
                         }
@@ -412,6 +800,7 @@ class TutorApp:
                             "slug": "proyecto-avanzado",
                             "title": "Proyecto avanzado",
                             "description": "Desarrollar una aplicación compleja con mejores prácticas",
+                            "language": language_default,
                             "difficulty": "hard",
                             "estimated_time": 120
                         }
@@ -541,6 +930,8 @@ Una vez completada esta unidad, podrás:
 
     async def process_command(self, command: str) -> None:
         """Procesar comando del usuario."""
+        self.render_shell(command)
+
         # Si no empieza con /, tratar como pregunta al tutor
         if not command.startswith('/'):
             await self.cmd_ask([command])
@@ -704,23 +1095,40 @@ Una vez completada esta unidad, podrás:
             lines = content.split('\n')
             page_size = 30
             total_pages = (len(lines) - 1) // page_size + 1
-            
-            for page in range(total_pages):
+            page = 0
+
+            while True:
+                page = max(0, min(page, total_pages - 1))
                 start_line = page * page_size
                 end_line = min((page + 1) * page_size, len(lines))
-                
+
+                self.render_shell(f"/read página {page+1}/{total_pages}")
                 print(f"\033[36m=== Unidad {self.current_unit.number}: {self.current_unit.title} (Página {page+1}/{total_pages}) ===\033[0m")
                 print()
-                
                 for line in lines[start_line:end_line]:
                     print(line)
-                
                 print()
-                
-                if page < total_pages - 1:
-                    response = self.get_input("Presiona Enter para continuar, 'q' para salir: ")
-                    if response.lower() in ['q', 'quit']:
+
+                if total_pages == 1:
+                    break
+
+                response = self.get_input("Enter/n siguiente | p anterior | número ir a página | q salir: ").lower()
+                if response in ("", "n", "next"):
+                    page += 1
+                    if page >= total_pages:
                         break
+                elif response in ("p", "prev", "anterior"):
+                    page -= 1
+                elif response in ("q", "quit"):
+                    break
+                elif response.isdigit():
+                    target = int(response) - 1
+                    if 0 <= target < total_pages:
+                        page = target
+                    else:
+                        self.print_error(f"Página fuera de rango 1-{total_pages}")
+                else:
+                    self.print_info("Comando no reconocido, usa Enter/n, p, número o q.")
 
             # Marcar como leído
             progress = self._get_unit_progress(self.current_unit.number)
@@ -734,7 +1142,7 @@ Una vez completada esta unidad, podrás:
             self.print_error(f"Error leyendo material: {e}")
 
     def _generate_basic_material(self, unit) -> str:
-        """Generar material básico para una unidad."""
+        """Generar material básico para una unidad (versión extendida)."""
         content = f"""# Unidad {unit.number}: {unit.title}
 
 ## Descripción
@@ -742,50 +1150,92 @@ Una vez completada esta unidad, podrás:
 
 ## Objetivos de Aprendizaje
 """
-        
         for i, objective in enumerate(unit.learning_objectives, 1):
             content += f"{i}. {objective}\n"
-        
+
         content += f"""
-## Contenido Principal
+## Contexto y Motivación
+Por qué importa: dominar {unit.title.lower()} te permite escribir código más legible, eficiente y seguro en proyectos reales. Verás cómo las decisiones de estructura de datos impactan en rendimiento, memoria y mantenibilidad.
 
-### Introducción
-Esta unidad cubre los conceptos fundamentales de {unit.title.lower()}.
+## Conceptos Clave (profundidad)
+- **Modelo mental:** cómo se representan internamente las colecciones en memoria.
+- **Complejidades:** costo Big-O de operaciones frecuentes (búsqueda, inserción, slicing, iteración).
+- **Iteración interna vs. externa:** diferencia entre `for` explícito y protocolos (`__iter__`, `__next__`).
+- **Evaluación perezosa:** cuándo usar generadores para streams grandes.
+- **Errores clásicos:** mutar mientras iteras, copias superficiales vs. profundas, fugas de memoria por referencias circulares.
 
-### Conceptos Clave
-- Concepto 1: Descripción básica
-- Concepto 2: Explicación detallada
-- Concepto 3: Ejemplos prácticos
+## Desarrollo Paso a Paso
+1) **Repaso de sintaxis**  
+   - List/dict/set comprehensions y filtros condicionales anidados.  
+   - Expresiones generadoras y su consumo en `sum`, `any`, `all`.
 
-### Ejemplos Prácticos
+2) **Iteradores bajo el capó**  
+   - Implementar una clase con `__iter__` y `__next__`.  
+   - Manejo de `StopIteration` y reinicio de iteradores.  
+   - Iterables vs. iteradores: diferencias prácticas.
+
+3) **Generadores**  
+   - `yield`, `yield from`, y cómo preservan estado.  
+   - Diseño de pipelines con backpressure simple (buffers pequeños).
+
+4) **itertools en acción**  
+   - Combinaciones, productos cartesianos, ventanas deslizantes, acumuladores.  
+   - Patrones: chunking de archivos grandes, deduplicación, merges ordenados.
+
+5) **Rendimiento**  
+   - Medir con `timeit` y `tracemalloc`.  
+   - Cuándo prefieres generadores vs. listas materializadas.  
+   - Coste de comprehensions anidadas vs. bucles tradicionales.
+
+## Ejemplos Profundos (Python)
 ```python
-# Ejemplo básico
-print("Hola, mundo!")
+# Ventanas deslizantes sin copiar listas completas
+from collections import deque
+
+def window(seq, size=3):
+    it = iter(seq)
+    buf = deque(maxlen=size)
+    for item in it:
+        buf.append(item)
+        if len(buf) == size:
+            yield tuple(buf)
+
+print(list(window(range(6), 3)))  # [(0,1,2),(1,2,3),(2,3,4),(3,4,5)]
 ```
 
-### Errores Comunes
-1. Error típico 1: Cómo evitarlo
-2. Error típico 2: Solución recomendada
+```python
+# Generador con backpressure simple
+def read_chunks(file_path, chunk_size=1024):
+    with open(file_path, \"rb\") as f:
+        while chunk := f.read(chunk_size):
+            yield chunk
+```
 
-### Checklist de Aprendizaje
-- [ ] Entender los conceptos básicos
-- [ ] Practicar con ejemplos
-- [ ] Resolver problemas relacionados
-- [ ] Completar los labs de práctica
+## Errores Comunes y Soluciones
+- Mutar una lista mientras se itera → usa comprensión para crear una nueva colección.
+- Usar listas cuando los datos son gigantes → cambia a generadores o `itertools.islice`.
+- Olvidar cerrar archivos → usa context managers o generadores con `with`.
+- Recalcular resultados caros → usa `functools.lru_cache` en iteradores idempotentes.
 
-## Próximos Pasos
-Una vez completada esta unidad, podrás:
-- Aplicar los conceptos aprendidos
-- Resolver problemas más complejos
-- Avanzar a la siguiente unidad
+## Checklist de Aprendizaje
+- [ ] Explicas la diferencia entre iterable e iterador con un ejemplo.
+- [ ] Implementas `__iter__`/`__next__` en una clase simple.
+- [ ] Diseñas un pipeline con al menos un generador y una función de reducción.
+- [ ] Justificas cuándo usar generadores vs. listas en términos de memoria y claridad.
+- [ ] Usas `itertools` para resolver un problema real (p. ej. log parsing).
 
-## Recursos Adicionales
-- Documentación oficial
-- Tutoriales en línea
-- Comunidad de desarrolladores
+## Ejercicio Guiado
+Implementa `batched(iterable, n)` que devuelva bloques de tamaño `n` sin copiar toda la lista. Añade pruebas que validen:
+- Casos exactos, sobrantes y `n=1`
+- Iterables infinitos simulados con un generador que corta tras N pasos
+
+## Profundiza Más
+- CPython internals: cómo el bytecode implementa `FOR_ITER`.
+- Coste de `list()` sobre un generador vs. `itertools.islice`.
+- Patrones de streaming: ETL, lectura de logs, sockets.
 
 ---
-*Material generado automáticamente. Para contenido más detallado, configura Ollama.*
+*Material extendido generado automáticamente. Para aún más detalle, habilita Ollama.*
 """
         return content
 
@@ -834,36 +1284,24 @@ Una vez completada esta unidad, podrás:
         unit_slug = f"{unit.number:02d}-{unit.slug}"
         return course_path / "units" / unit_slug
 
-    def _ensure_lab_structure(self, unit_path: Path, lab_slug: str, lab_title: str) -> Path:
-        """Crear estructura de lab si no existe."""
+    def _ensure_lab_structure(self, unit_path: Path, lab_slug: str, lab_title: str, language: str | None = None, lab_type: str | None = None, scaffold: bool = False) -> Path:
+        """Crear estructura base de lab (sin solución)."""
         lab_path = unit_path / "labs" / lab_slug
         lab_path.mkdir(parents=True, exist_ok=True)
-        (lab_path / "starter").mkdir(exist_ok=True)
-        (lab_path / "submission").mkdir(exist_ok=True)
-        (lab_path / "tests").mkdir(exist_ok=True)
+        lang = language or self._detect_language_for_unit()
+        ltype = lab_type or "full"
 
-        readme_path = lab_path / "README.md"
-        if not readme_path.exists():
-            readme_content = f"""# {lab_title}
-
-## Objetivo
-Completar el ejercicio práctico relacionado con la unidad actual.
-
-## Instrucciones
-1. Revisa el material de la unidad con `/read`.
-2. Implementa la solución en la carpeta `submission/`.
-3. Ejecuta `/submit` para evaluar tu solución.
-
-## Criterios de evaluación
-- Correctitud de la solución
-- Calidad del código
-- Cumplimiento de requisitos
-"""
-            readme_path.write_text(readme_content, encoding="utf-8")
+        # Solo metadata y grade; no plantillas si scaffold=False
+        self._save_lab_meta(lab_path, {"slug": lab_slug, "title": lab_title, "language": lang, "lab_type": ltype})
 
         grade_path = lab_path / "grade.json"
         if not grade_path.exists():
             grade_path.write_text("{}", encoding="utf-8")
+
+        # Crear carpetas vacías
+        (lab_path / "starter").mkdir(exist_ok=True)
+        (lab_path / "submission").mkdir(exist_ok=True)
+        (lab_path / "tests").mkdir(exist_ok=True)
 
         return lab_path
 
@@ -1024,8 +1462,7 @@ Adapta tu respuesta al nivel del estudiante."""
 
     def show_welcome(self) -> None:
         """Mostrar mensaje de bienvenida."""
-        self.print_logo()
-        self.print_header()
+        self.render_shell()
         self.print_info("Escribe cualquier pregunta para hablar con el tutor")
         self.print_info("O usa comandos con / al inicio: /help, /new, /read, etc.")
         print()
@@ -1222,62 +1659,74 @@ Adapta tu respuesta al nivel del estudiante."""
         labs_dir = unit_path / "labs"
         labs_dir.mkdir(parents=True, exist_ok=True)
 
-        # Obtener labs desde el modelo o el disco
-        labs = []
+        labs = self._list_unit_labs(unit_path)
         if getattr(self.current_unit, "labs", None):
-            labs = [lab.slug for lab in self.current_unit.labs]
+            labs.extend([lab.slug for lab in self.current_unit.labs if lab.slug not in labs])
+        labs = sorted(set(labs))
+        language_hint = self._detect_language_for_unit()
+
+        # Parseo de argumentos: slug opcional, tipo opcional, idioma opcional
+        desired = None
+        lab_type = "full"
+        language_hint_arg = None
+        type_alias = {
+            "full": "full",
+            "bugfix": "bugfix",
+            "fix": "bugfix",
+            "patch": "bugfix",
+            "fill": "fill",
+            "skeleton": "fill",
+            "complete": "full",
+        }
+        known_langs = {"python", "javascript", "typescript", "js", "ts", "c", "c99", "c11", "cpp", "c++", "cpp17", "cpp20", "go", "java", "sql"}
+
+        for arg in args:
+            lower = arg.lower()
+            if lower in type_alias:
+                lab_type = type_alias[lower]
+                continue
+            if lower in known_langs or lower.startswith("lang=") or lower.startswith("lang:"):
+                value = lower.split("=", 1)[-1].split(":", 1)[-1] if ("=" in lower or ":" in lower) else lower
+                language_hint_arg = value
+                continue
+            if desired is None:
+                desired = arg
+
+        # Determinar lab objetivo
+        if desired:
+            desired = self._normalize_lab_slug(desired, labs)
+        elif self.current_state and self.current_state.current_lab:
+            desired = self.current_state.current_lab
         else:
-            labs = sorted([p.name for p in labs_dir.iterdir() if p.is_dir()]) if labs_dir.exists() else []
+            desired = self._next_lab_slug(labs)
 
-        if not labs:
-            labs = ["lab-01"]
+        is_new = desired not in labs
+        if is_new:
+            labs = sorted(set(labs + [desired]))
 
-        selected_lab = None
-        if args:
-            selection = args[0]
-            try:
-                idx = int(selection) - 1
-                if 0 <= idx < len(labs):
-                    selected_lab = labs[idx]
-                else:
-                    self.print_error("Número de lab inválido")
-                    return
-            except ValueError:
-                if selection in labs:
-                    selected_lab = selection
-                else:
-                    self.print_error(f"Lab '{selection}' no encontrado")
-                    return
-        else:
-            selected_lab = labs[0]
+        lab_title = f"{self.current_unit.title} - {desired}"
+        lang_final = language_hint_arg or language_hint
+        lab_path = self._ensure_lab_structure(unit_path, desired, lab_title, lang_final, lab_type, scaffold=not is_new)
 
-        lab_title = f"Lab {selected_lab} - {self.current_unit.title}"
-        lab_path = self._ensure_lab_structure(unit_path, selected_lab, lab_title)
+        # Si es nuevo, intentar generarlo con IA
+        if is_new:
+            generated = await self._generate_lab_with_ai(lab_path, lab_title, lang_final, lab_type)
+            if not generated:
+                self.print_error("No se pudo generar el lab con IA. Estructura vacía creada.")
 
-        # Crear starter y tests básicos si no existen
-        starter_file = lab_path / "starter" / "main.py"
-        if not starter_file.exists():
-            starter_file.write_text(
-                """def solve():\n    return "ok"\n\nif __name__ == '__main__':\n    print(solve())\n""",
-                encoding="utf-8",
-            )
-
-        test_file = lab_path / "tests" / "test_main.py"
-        if not test_file.exists():
-            test_file.write_text(
-                """from submission.main import solve\n\n\ndef test_solve():\n    assert solve() == 'ok'\n""",
-                encoding="utf-8",
-            )
+        lab_language = self._infer_lab_language(lab_path, lang_final)
+        lab_type = self._infer_lab_type(lab_path, lab_type)
 
         # Actualizar estado
         self._ensure_unit_progress_dict()
-        self.current_state.current_lab = selected_lab
+        self.current_state.current_lab = desired
         progress = self._get_unit_progress(self.current_unit.number)
         if progress:
             progress.status = "practicing"
         self.persistence.save_state(self.current_state)
 
-        self.print_success(f"Lab seleccionado: {selected_lab}")
+        self.print_info(f"Labs disponibles: {', '.join(labs)}")
+        self.print_success(f"Lab seleccionado: {desired} ({lab_language}, tipo {lab_type})")
         self.print_info(f"Ruta: {lab_path}")
 
         # Abrir editor automáticamente
@@ -1295,12 +1744,14 @@ Adapta tu respuesta al nivel del estudiante."""
 
         unit_path = self._get_unit_path(self.current_unit)
         lab_slug = self.current_state.current_lab
-        lab_path = self._ensure_lab_structure(unit_path, lab_slug, f"Lab {lab_slug}")
+        lab_path = self._ensure_lab_structure(unit_path, lab_slug, f"Lab {lab_slug}", self._detect_language_for_unit())
+        lab_language = self._infer_lab_language(lab_path, self._detect_language_for_unit())
+        lab_type = self._infer_lab_type(lab_path, "full")
 
         from ..core.course import Lab
         from ..labs.workspace import LabWorkspace
 
-        lab = Lab(slug=lab_slug, title=f"Lab {lab_slug}", description="")
+        lab = Lab(slug=lab_slug, title=f"Lab {lab_slug}", description="", language=lab_language, lab_type=lab_type)
         lab.path = lab_path
         lab.readme_path = lab_path / "README.md"
         lab.starter_path = lab_path / "starter"
@@ -1328,13 +1779,15 @@ Adapta tu respuesta al nivel del estudiante."""
 
         unit_path = self._get_unit_path(self.current_unit)
         lab_slug = self.current_state.current_lab
-        lab_path = self._ensure_lab_structure(unit_path, lab_slug, f"Lab {lab_slug}")
+        lab_path = self._ensure_lab_structure(unit_path, lab_slug, f"Lab {lab_slug}", self._detect_language_for_unit())
+        lab_language = self._infer_lab_language(lab_path, self._detect_language_for_unit())
+        lab_type = self._infer_lab_type(lab_path, "full")
 
         from ..core.course import Lab
-        from ..labs.evaluator import PythonEvaluator
+        from ..labs.evaluator import get_evaluator
         from ..core.state import LabResult
 
-        lab = Lab(slug=lab_slug, title=f"Lab {lab_slug}", description="")
+        lab = Lab(slug=lab_slug, title=f"Lab {lab_slug}", description="", language=lab_language, lab_type=lab_type)
         lab.path = lab_path
         lab.readme_path = lab_path / "README.md"
         lab.starter_path = lab_path / "starter"
@@ -1342,7 +1795,7 @@ Adapta tu respuesta al nivel del estudiante."""
         lab.tests_path = lab_path / "tests"
         lab.grade_path = lab_path / "grade.json"
 
-        evaluator = PythonEvaluator(lab)
+        evaluator = get_evaluator(lab)
         result = evaluator.evaluate()
 
         lab_result = LabResult(
@@ -1434,6 +1887,7 @@ Adapta tu respuesta al nivel del estudiante."""
 
     async def process_command(self, command: str) -> None:
         """Procesar comando del usuario."""
+        self.render_shell(command)
         # Si no empieza con /, tratar como pregunta al tutor
         if not command.startswith('/'):
             await self.cmd_ask([command])

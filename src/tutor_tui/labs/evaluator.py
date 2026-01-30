@@ -122,20 +122,20 @@ class PythonEvaluator(Evaluator):
                 errors=["Lab mal configurado: falta submission_path o tests_path"],
             )
 
-        # Verificar que hay archivos de submission
-        submission_files = list(self.lab.submission_path.rglob("*.py"))
-        if not submission_files:
-            return GradeResult(
-                score=0.0,
-                errors=["No se encontraron archivos .py en la carpeta de entrega"],
-            )
-
         # Verificar tests
         test_files = list(self.lab.tests_path.rglob("test*.py"))
         if not test_files:
             return GradeResult(
                 score=0.0,
                 errors=["No se encontraron archivos de test"],
+            )
+
+        # Verificar que hay archivos de submission (cualquier tipo)
+        submission_files = [p for p in self.lab.submission_path.rglob("*") if p.is_file()]
+        if not submission_files:
+            return GradeResult(
+                score=0.0,
+                errors=["La carpeta de entrega está vacía"],
             )
 
         # Ejecutar evaluación
@@ -407,12 +407,87 @@ class PythonEvaluator(Evaluator):
             shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
+class JavaScriptEvaluator(Evaluator):
+    """Evaluador simple para labs de JavaScript."""
+
+    @property
+    def language(self) -> str:
+        return "javascript"
+
+    def evaluate(self) -> GradeResult:
+        """Ejecutar tests con Node."""
+        if not self.lab.submission_path or not self.lab.tests_path:
+            return GradeResult(
+                score=0.0,
+                errors=["Lab mal configurado: falta submission_path o tests_path"],
+            )
+
+        submission_files = list(self.lab.submission_path.rglob("*.js"))
+        test_files = list(self.lab.tests_path.rglob("test*.js"))
+        if not submission_files:
+            return GradeResult(
+                score=0.0,
+                errors=["No se encontraron archivos .js en la carpeta de entrega"],
+            )
+        if not test_files:
+            return GradeResult(score=0.0, errors=["No se encontraron archivos de test .js"])
+
+        try:
+            result = subprocess.run(
+                ["node", str(test_files[0])],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                cwd=self.lab.tests_path.parent,
+            )
+        except FileNotFoundError:
+            return GradeResult(score=0.0, errors=["Node.js no está instalado o no está en PATH"])
+        except subprocess.TimeoutExpired:
+            return GradeResult(score=0.0, errors=[f"Timeout: más de {self.timeout}s ejecutando tests"])
+
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        passed = result.returncode == 0
+        passed_tests = 0
+        total_tests = 0
+
+        # Si el test imprime JSON, úsalo
+        try:
+            if stdout:
+                data = json.loads(stdout.splitlines()[-1])
+                passed_tests = int(data.get("passed", 0))
+                total_tests = int(data.get("total", passed_tests))
+                passed = passed_tests == total_tests and result.returncode == 0
+        except Exception:
+            pass
+
+        errors = []
+        if not passed:
+            if stderr:
+                errors.append(stderr)
+            if stdout:
+                errors.append(stdout)
+
+        grade = GradeResult(
+            score=100.0 if passed else 0.0,
+            passed=passed,
+            passed_tests=passed_tests,
+            total_tests=total_tests or (passed_tests if passed_tests else len(test_files)),
+            errors=errors[:5],
+        )
+
+        self.save_grade(grade)
+        return grade
+
+
 def get_evaluator(lab: Lab) -> Evaluator:
     """Factory para obtener evaluador apropiado."""
     # Detectar lenguaje por archivos en tests
     if lab.tests_path and lab.tests_path.exists():
         if any(lab.tests_path.rglob("*.py")):
             return PythonEvaluator(lab)
+        if any(lab.tests_path.rglob("*.js")):
+            return JavaScriptEvaluator(lab)
 
     # Default a Python si no se detecta
     return PythonEvaluator(lab)

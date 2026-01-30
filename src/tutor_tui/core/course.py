@@ -17,6 +17,8 @@ class Lab:
     slug: str
     title: str
     description: str
+    language: str = "python"
+    lab_type: str = "full"  # full, bugfix, fill
     difficulty: str = "medium"  # easy, medium, hard
     prerequisites: list[str] = field(default_factory=list)
     estimated_time: int = 30  # minutos
@@ -36,6 +38,8 @@ class Lab:
             "slug": self.slug,
             "title": self.title,
             "description": self.description,
+            "language": self.language,
+            "lab_type": self.lab_type,
             "difficulty": self.difficulty,
             "prerequisites": self.prerequisites,
             "estimated_time": self.estimated_time,
@@ -49,6 +53,8 @@ class Lab:
             slug=data["slug"],
             title=data["title"],
             description=data["description"],
+            language=data.get("language", "python"),
+            lab_type=data.get("lab_type", "full"),
             difficulty=data.get("difficulty", "medium"),
             prerequisites=data.get("prerequisites", []),
             estimated_time=data.get("estimated_time", 30),
